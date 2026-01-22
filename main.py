@@ -318,7 +318,14 @@ async def monitor_blockchain():
                 await asyncio.sleep(30)
                 continue
             
-            logger.info(f"Проверка блоков {db.last_block + 1} - {current_block}")
+            blocks_to_check = current_block - db.last_block
+            
+            if blocks_to_check > 20:
+                to_block = db.last_block + 20
+            else:
+                to_block = current_block
+            
+            logger.info(f"Проверка блоков {db.last_block + 1} - {to_block}")
             
             for wallet in db.wallets:
                 wallet_address = wallet["address"]
@@ -334,12 +341,14 @@ async def monitor_blockchain():
                         token_symbol=token_symbol,
                         token_address=token_address,
                         from_block=db.last_block + 1,
-                        to_block=current_block
+                        to_block=to_block
                     )
+                    
+                    await asyncio.sleep(0.5)
             
-            db.update_last_block(current_block)
+            db.update_last_block(to_block)
             
-            await asyncio.sleep(30)
+            await asyncio.sleep(15)
             
         except Exception as e:
             logger.error(f"Ошибка мониторинга: {e}")
