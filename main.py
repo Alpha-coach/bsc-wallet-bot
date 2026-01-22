@@ -7,6 +7,7 @@ from aiogram.filters import Command
 from aiogram.types import Message
 from web3 import Web3
 import json
+import aiohttp
 
 logging.basicConfig(
     level=logging.INFO,
@@ -17,6 +18,7 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 TELEGRAM_USER_ID = int(os.getenv("TELEGRAM_USER_ID"))
 BNB_RPC = os.getenv("BNB_RPC", "https://bsc-dataseed.binance.org/")
+BSCSCAN_API_KEY = os.getenv("BSCSCAN_API_KEY")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -41,7 +43,7 @@ TOKENS = {
     }
 }
 
-ERC20_ABI = json.loads('[{"constant":true,"inputs":[{"name":"_owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"balance","type":"uint256"}],"type":"function"},{"anonymous":false,"inputs":[{"indexed":true,"name":"from","type":"address"},{"indexed":true,"name":"to","type":"address"},{"indexed":false,"name":"value","type":"uint256"}],"name":"Transfer","type":"event"}]')
+ERC20_ABI = json.loads('[{"constant":true,"inputs":[{"name":"_owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"balance","type":"uint256"}],"type":"function"}]')
 
 class SimpleDB:
     def __init__(self):
@@ -243,64 +245,90 @@ async def send_transaction_alert(wallet_name, wallet_address, token_symbol, amou
     except Exception as e:
         logger.error(f"Ошибка отправки уведомления: {e}")
 
-async def check_token_transfers(wallet_address, token_symbol, token_address, from_block, to_block):
+async def get_token_transfers_bscscan(address, token_address, start_block):
+    try:
+        url = "https://api.bscscan.com/api"
+        params = {
+            "module": "account",
+            "action": "tokentx",
+            "contractaddress": token_address,
+            "address": address,
+            "startblock": start_block,
+            "endblock": "latest",
+            "sort": "asc",
+            "apikey": BSCSCAN_API_KEY
+        }
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params) as response:
+                data = await response.json()
+                
+                if data["status"] == "1":
+                    return data["result"]
+                else:
+                    return []
+                    
+    except Exception as e:
+        logger.error(f"Ошибка BscScan API: {e}")
+        return []
+
+async def check_wallet_transactions(wallet_address, wallet_name):
     try:
         wallet_address = Web3.to_checksum_address(wallet_address)
-        token_address = Web3.to_checksum_address(token_address)
         
-        contract = w3.eth.contract(address=token_address, abi=ERC20_ABI)
-        
-        transfer_filter = contract.events.Transfer.create_filter(
-            from_block=from_block,
-            to_block=to_block
-        )
-        
-        events = transfer_filter.get_all_entries()
-        
-        for event in events:
-            from_addr = event['args']['from']
-            to_addr = event['args']['to']
-            value = event['args']['value']
-            tx_hash = event['transactionHash'].hex()
-            
-            if db.is_processed(tx_hash):
+        for token_symbol, token_info in TOKENS.items():
+            if token_symbol == "BNB":
                 continue
             
-            is_incoming = to_addr.lower() == wallet_address.lower()
-            is_outgoing = from_addr.lower() == wallet_address.lower()
+            token_address = token_info["address"]
             
-            if not (is_incoming or is_outgoing):
-                continue
-            
-            decimals = TOKENS[token_symbol]["decimals"]
-            amount = value / (10 ** decimals)
-            
-            direction = "IN" if is_incoming else "OUT"
-            
-            wallet_name = "Main"
-            for wallet in db.wallets:
-                if wallet["address"].lower() == wallet_address.lower():
-                    wallet_name = wallet["name"]
-                    break
-            
-            await send_transaction_alert(
-                wallet_name=wallet_name,
-                wallet_address=wallet_address,
-                token_symbol=token_symbol,
-                amount=amount,
-                direction=direction,
-                from_addr=from_addr,
-                to_addr=to_addr,
-                tx_hash=tx_hash
+            transactions = await get_token_transfers_bscscan(
+                address=wallet_address,
+                token_address=token_address,
+                start_block=db.last_block + 1
             )
             
-            db.mark_processed(tx_hash)
+            for tx in transactions:
+                tx_hash = tx["hash"]
+                
+                if db.is_processed(tx_hash):
+                    continue
+                
+                from_addr = tx["from"]
+                to_addr = tx["to"]
+                value = int(tx["value"])
+                
+                is_incoming = to_addr.lower() == wallet_address.lower()
+                is_outgoing = from_addr.lower() == wallet_address.lower()
+                
+                if not (is_incoming or is_outgoing):
+                    continue
+                
+                decimals = token_info["decimals"]
+                amount = value / (10 ** decimals)
+                
+                direction = "IN" if is_incoming else "OUT"
+                
+                await send_transaction_alert(
+                    wallet_name=wallet_name,
+                    wallet_address=wallet_address,
+                    token_symbol=token_symbol,
+                    amount=amount,
+                    direction=direction,
+                    from_addr=from_addr,
+                    to_addr=to_addr,
+                    tx_hash=tx_hash
+                )
+                
+                db.mark_processed(tx_hash)
+            
+            await asyncio.sleep(0.3)
             
     except Exception as e:
-        logger.error(f"Ошибка проверки {token_symbol} transfers: {e}")
+        logger.error(f"Ошибка проверки транзакций: {e}")
 
 async def monitor_blockchain():
-    logger.info("🔍 Мониторинг блокчейна запущен")
+    logger.info("🔍 Мониторинг блокчейна запущен (BscScan API)")
     
     if db.last_block == 0:
         db.last_block = w3.eth.block_number
@@ -318,37 +346,17 @@ async def monitor_blockchain():
                 await asyncio.sleep(30)
                 continue
             
-            blocks_to_check = current_block - db.last_block
-            
-            if blocks_to_check > 20:
-                to_block = db.last_block + 20
-            else:
-                to_block = current_block
-            
-            logger.info(f"Проверка блоков {db.last_block + 1} - {to_block}")
+            logger.info(f"Проверка транзакций с блока {db.last_block + 1}")
             
             for wallet in db.wallets:
-                wallet_address = wallet["address"]
-                
-                for token_symbol, token_info in TOKENS.items():
-                    if token_symbol == "BNB":
-                        continue
-                    
-                    token_address = token_info["address"]
-                    
-                    await check_token_transfers(
-                        wallet_address=wallet_address,
-                        token_symbol=token_symbol,
-                        token_address=token_address,
-                        from_block=db.last_block + 1,
-                        to_block=to_block
-                    )
-                    
-                    await asyncio.sleep(0.5)
+                await check_wallet_transactions(
+                    wallet_address=wallet["address"],
+                    wallet_name=wallet["name"]
+                )
             
-            db.update_last_block(to_block)
+            db.update_last_block(current_block)
             
-            await asyncio.sleep(15)
+            await asyncio.sleep(30)
             
         except Exception as e:
             logger.error(f"Ошибка мониторинга: {e}")
@@ -361,6 +369,11 @@ async def main():
         logger.info(f"✅ Подключен к BSC (блок: {w3.eth.block_number})")
     else:
         logger.error("❌ Не удалось подключиться к BSC RPC")
+    
+    if not BSCSCAN_API_KEY:
+        logger.error("❌ BSCSCAN_API_KEY не установлен!")
+    else:
+        logger.info("✅ BscScan API ключ найден")
     
     asyncio.create_task(monitor_blockchain())
     
