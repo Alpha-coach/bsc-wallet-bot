@@ -8,24 +8,20 @@ from aiogram.types import Message
 from web3 import Web3
 import json
 
-# Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# Конфигурация из переменных окружения
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 TELEGRAM_USER_ID = int(os.getenv("TELEGRAM_USER_ID"))
 BNB_RPC = os.getenv("BNB_RPC", "https://bsc-dataseed.binance.org/")
 
-# Инициализация
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 w3 = Web3(Web3.HTTPProvider(BNB_RPC))
 
-# Токены BSC
 TOKENS = {
     "BNB": {
         "address": None,
@@ -45,10 +41,8 @@ TOKENS = {
     }
 }
 
-# ABI для ERC20
-ERC20_ABI = json.loads('[{"constant":true,"inputs":[{"name":"_owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"balance","type":"uint256"}],"type":"function"}]')
+ERC20_ABI = json.loads('[{"constant":true,"inputs":[{"name":"_owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"balance","type":"uint256"}],"type":"function"},{"anonymous":false,"inputs":[{"indexed":true,"name":"from","type":"address"},{"indexed":true,"name":"to","type":"address"},{"indexed":false,"name":"value","type":"uint256"}],"name":"Transfer","type":"event"}]')
 
-# База данных
 class SimpleDB:
     def __init__(self):
         self.wallets = []
@@ -99,7 +93,6 @@ class SimpleDB:
 
 db = SimpleDB()
 
-# Функции работы с блокчейном
 def get_balance(address, token_symbol):
     try:
         address = Web3.to_checksum_address(address)
@@ -219,10 +212,135 @@ async def cmd_wallets(message: Message):
     
     await message.answer(msg)
 
+async def send_transaction_alert(wallet_name, wallet_address, token_symbol, amount, direction, from_addr, to_addr, tx_hash):
+    try:
+        if direction == "IN":
+            emoji = "🟢"
+        else:
+            emoji = "🔴"
+        
+        new_balance = get_balance(wallet_address, token_symbol)
+        
+        msg = f"{emoji} {direction} | {format_balance(amount)} {token_symbol}\n"
+        
+        if direction == "IN":
+            msg += f"From: {format_address(from_addr)}\n"
+        else:
+            msg += f"To: {format_address(to_addr)}\n"
+        
+        msg += f"💰 Новый баланс: {format_balance(new_balance)} {token_symbol}\n"
+        msg += f"🔗 <a href='https://bscscan.com/tx/{tx_hash}'>Tx</a>"
+        
+        await bot.send_message(
+            chat_id=TELEGRAM_USER_ID,
+            text=msg,
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
+        
+        logger.info(f"Отправлено уведомление: {direction} {amount} {token_symbol}")
+        
+    except Exception as e:
+        logger.error(f"Ошибка отправки уведомления: {e}")
+
+async def check_token_transfers(wallet_address, token_symbol, token_address, from_block, to_block):
+    try:
+        wallet_address = Web3.to_checksum_address(wallet_address)
+        token_address = Web3.to_checksum_address(token_address)
+        
+        contract = w3.eth.contract(address=token_address, abi=ERC20_ABI)
+        
+        transfer_filter = contract.events.Transfer.create_filter(
+            fromBlock=from_block,
+            toBlock=to_block
+        )
+        
+        events = transfer_filter.get_all_entries()
+        
+        for event in events:
+            from_addr = event['args']['from']
+            to_addr = event['args']['to']
+            value = event['args']['value']
+            tx_hash = event['transactionHash'].hex()
+            
+            if db.is_processed(tx_hash):
+                continue
+            
+            is_incoming = to_addr.lower() == wallet_address.lower()
+            is_outgoing = from_addr.lower() == wallet_address.lower()
+            
+            if not (is_incoming or is_outgoing):
+                continue
+            
+            decimals = TOKENS[token_symbol]["decimals"]
+            amount = value / (10 ** decimals)
+            
+            direction = "IN" if is_incoming else "OUT"
+            
+            wallet_name = "Main"
+            for wallet in db.wallets:
+                if wallet["address"].lower() == wallet_address.lower():
+                    wallet_name = wallet["name"]
+                    break
+            
+            await send_transaction_alert(
+                wallet_name=wallet_name,
+                wallet_address=wallet_address,
+                token_symbol=token_symbol,
+                amount=amount,
+                direction=direction,
+                from_addr=from_addr,
+                to_addr=to_addr,
+                tx_hash=tx_hash
+            )
+            
+            db.mark_processed(tx_hash)
+            
+    except Exception as e:
+        logger.error(f"Ошибка проверки {token_symbol} transfers: {e}")
+
 async def monitor_blockchain():
+    logger.info("🔍 Мониторинг блокчейна запущен")
+    
+    if db.last_block == 0:
+        db.last_block = w3.eth.block_number
+        db.save()
+    
     while True:
         try:
+            if not db.wallets:
+                await asyncio.sleep(30)
+                continue
+            
+            current_block = w3.eth.block_number
+            
+            if current_block <= db.last_block:
+                await asyncio.sleep(30)
+                continue
+            
+            logger.info(f"Проверка блоков {db.last_block + 1} - {current_block}")
+            
+            for wallet in db.wallets:
+                wallet_address = wallet["address"]
+                
+                for token_symbol, token_info in TOKENS.items():
+                    if token_symbol == "BNB":
+                        continue
+                    
+                    token_address = token_info["address"]
+                    
+                    await check_token_transfers(
+                        wallet_address=wallet_address,
+                        token_symbol=token_symbol,
+                        token_address=token_address,
+                        from_block=db.last_block + 1,
+                        to_block=current_block
+                    )
+            
+            db.update_last_block(current_block)
+            
             await asyncio.sleep(30)
+            
         except Exception as e:
             logger.error(f"Ошибка мониторинга: {e}")
             await asyncio.sleep(60)
@@ -236,6 +354,7 @@ async def main():
         logger.error("❌ Не удалось подключиться к BSC RPC")
     
     asyncio.create_task(monitor_blockchain())
+    
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
