@@ -1,7 +1,7 @@
 import os
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import Message
@@ -164,7 +164,7 @@ async def cmd_balance(message: Message):
         for token, amount in balances.items():
             msg += f"{token:4} · {format_balance(amount)}\n"
         
-        now_utc = datetime.utcnow().strftime("%H:%M UTC")
+        now_utc = datetime.now(timezone.utc).strftime("%H:%M UTC")
         msg += f"\n🕒 обновлено: {now_utc}"
         
         await message.answer(msg)
@@ -251,8 +251,8 @@ async def check_token_transfers(wallet_address, token_symbol, token_address, fro
         contract = w3.eth.contract(address=token_address, abi=ERC20_ABI)
         
         transfer_filter = contract.events.Transfer.create_filter(
-            fromBlock=from_block,
-            toBlock=to_block
+            from_block=from_block,
+            to_block=to_block
         )
         
         events = transfer_filter.get_all_entries()
