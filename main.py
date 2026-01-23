@@ -65,7 +65,7 @@ TOKENS = {
     }
 }
 
-# Transfer event signature (keccak256("Transfer(address,address,uint256)"))
+# Transfer event signature
 TRANSFER_EVENT_SIGNATURE = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 
 ERC20_ABI = [
@@ -132,7 +132,7 @@ class SimpleDB:
     def __init__(self):
         self.wallets = []
         self.processed_txs = {}
-        self.last_block = None  # ИСПРАВЛЕНИЕ #3: персистим last_block
+        self.last_block = None
         self.load()
     
     def load(self):
@@ -157,15 +157,16 @@ class SimpleDB:
                 json.dump({
                     "wallets": self.wallets,
                     "processed_txs": list(self.processed_txs.keys()),
-                    "last_block": self.last_block  # Сохраняем последний блок
+                    "last_block": self.last_block
                 }, f, indent=2)
         except Exception as e:
             logger.error(f"Ошибка сохранения БД: {e}")
     
     def update_last_block(self, block_num):
-        """Обновляем последний обработанный блок"""
         self.last_block = block_num
-        self.save()
+        # Сохраняем каждые 10 блоков для производительности
+        if block_num % 10 == 0:
+            self.save()
     
     def add_wallet(self, address, name="Main"):
         current_block = w3.eth.block_number
@@ -203,7 +204,6 @@ class SimpleDB:
         if len(self.processed_txs) > 10000:
             keys = list(self.processed_txs.keys())
             self.processed_txs = {k: True for k in keys[-5000:]}
-        self.save()
     
     def is_processed(self, tx_hash, wallet_address):
         key = f"{tx_hash}:{wallet_address.lower()}"
@@ -419,73 +419,73 @@ async def send_transaction_alert(wallet_name, wallet_address, token_symbol, amou
 
 def parse_transfer_events_from_logs(logs, wallet_addresses_dict, token_addresses_reverse):
     """
-    ИСПРАВЛЕНИЕ #1 и #2: 
     Парсим Transfer события напрямую из logs за ОДИН проход
-    Не фильтруем по tx.to - ловим ВСЕ Transfer события
     """
     transfers = []
     
     for log in logs:
-        # Проверяем что это Transfer event
-        if len(log['topics']) != 3:
+        try:
+            # Проверяем что это Transfer event
+            if len(log['topics']) != 3:
+                continue
+            
+            if log['topics'][0].hex() != TRANSFER_EVENT_SIGNATURE:
+                continue
+            
+            # Проверяем что это наш токен
+            token_address = log['address'].lower()
+            if token_address not in token_addresses_reverse:
+                continue
+            
+            token_symbol = token_addresses_reverse[token_address]
+            token_info = TOKENS[token_symbol]
+            
+            # Декодируем from/to из topics
+            from_addr = '0x' + log['topics'][1].hex()[-40:]
+            to_addr = '0x' + log['topics'][2].hex()[-40:]
+            
+            from_addr = from_addr.lower()
+            to_addr = to_addr.lower()
+            
+            # Декодируем value из data
+            value = int(log['data'].hex(), 16)
+            amount = value / (10 ** token_info["decimals"])
+            
+            # Проверяем участвует ли наш кошелёк
+            if to_addr in wallet_addresses_dict:
+                wallet_data = wallet_addresses_dict[to_addr]
+                transfers.append({
+                    "wallet_address": wallet_data["address"],
+                    "wallet_name": wallet_data["name"],
+                    "token_symbol": token_symbol,
+                    "amount": amount,
+                    "direction": "IN",
+                    "from_addr": '0x' + log['topics'][1].hex()[-40:],
+                    "to_addr": wallet_data["address"]
+                })
+            
+            elif from_addr in wallet_addresses_dict:
+                wallet_data = wallet_addresses_dict[from_addr]
+                transfers.append({
+                    "wallet_address": wallet_data["address"],
+                    "wallet_name": wallet_data["name"],
+                    "token_symbol": token_symbol,
+                    "amount": amount,
+                    "direction": "OUT",
+                    "from_addr": wallet_data["address"],
+                    "to_addr": '0x' + log['topics'][2].hex()[-40:]
+                })
+        except:
             continue
-        
-        if log['topics'][0].hex() != TRANSFER_EVENT_SIGNATURE:
-            continue
-        
-        # Проверяем что это наш токен
-        token_address = log['address'].lower()
-        if token_address not in token_addresses_reverse:
-            continue
-        
-        token_symbol = token_addresses_reverse[token_address]
-        token_info = TOKENS[token_symbol]
-        
-        # Декодируем from/to из topics
-        from_addr = '0x' + log['topics'][1].hex()[-40:]
-        to_addr = '0x' + log['topics'][2].hex()[-40:]
-        
-        from_addr = from_addr.lower()
-        to_addr = to_addr.lower()
-        
-        # Декодируем value из data
-        value = int(log['data'].hex(), 16)
-        amount = value / (10 ** token_info["decimals"])
-        
-        # Проверяем участвует ли наш кошелёк
-        if to_addr in wallet_addresses_dict:
-            wallet_data = wallet_addresses_dict[to_addr]
-            transfers.append({
-                "wallet_address": wallet_data["address"],
-                "wallet_name": wallet_data["name"],
-                "token_symbol": token_symbol,
-                "amount": amount,
-                "direction": "IN",
-                "from_addr": '0x' + log['topics'][1].hex()[-40:],
-                "to_addr": wallet_data["address"]
-            })
-        
-        elif from_addr in wallet_addresses_dict:
-            wallet_data = wallet_addresses_dict[from_addr]
-            transfers.append({
-                "wallet_address": wallet_data["address"],
-                "wallet_name": wallet_data["name"],
-                "token_symbol": token_symbol,
-                "amount": amount,
-                "direction": "OUT",
-                "from_addr": wallet_data["address"],
-                "to_addr": '0x' + log['topics'][2].hex()[-40:]
-            })
     
     return transfers
 
 async def monitor_new_blocks():
     """
-    ПРОДАКШН мониторинг с исправлениями #1-#4
+    ОПТИМИЗИРОВАННЫЙ мониторинг
     """
     logger.info("Мониторинг запущен")
     
-    # ИСПРАВЛЕНИЕ #3: используем сохранённый last_block
     if db.last_block:
         last_block = db.last_block
         logger.info(f"Восстановлен последний блок: {last_block}")
@@ -493,7 +493,7 @@ async def monitor_new_blocks():
         last_block = w3.eth.block_number
         logger.info(f"Начальный блок: {last_block}")
     
-    # Подготовка: маппинг адресов токенов
+    # Маппинг адресов токенов
     token_addresses_reverse = {}
     for token_symbol, token_info in TOKENS.items():
         if token_info["address"]:
@@ -505,14 +505,26 @@ async def monitor_new_blocks():
             
             if current_block > last_block:
                 blocks_count = current_block - last_block
-                logger.info(f"Новых блоков: {blocks_count}")
                 
-                for block_num in range(last_block + 1, current_block + 1):
+                # ОПТИМИЗАЦИЯ: максимум 5 блоков за раз
+                blocks_to_process = min(blocks_count, 5)
+                
+                if blocks_count > 5:
+                    logger.info(f"Новых блоков: {blocks_count}, обрабатываем: {blocks_to_process}")
+                else:
+                    logger.info(f"Новых блоков: {blocks_to_process}")
+                
+                for block_num in range(last_block + 1, last_block + blocks_to_process + 1):
                     block = w3.eth.get_block(block_num, full_transactions=True)
                     
                     wallet_addresses_dict = {
                         w["address"].lower(): w for w in db.wallets
                     }
+                    
+                    # Если нет кошельков - пропускаем блок
+                    if not wallet_addresses_dict:
+                        db.update_last_block(block_num)
+                        continue
                     
                     for tx in block.transactions:
                         tx_hash = tx.hash.hex()
@@ -558,15 +570,18 @@ async def monitor_new_blocks():
                                     db.mark_processed(tx_hash, wallet_data["address"])
                         
                         # ========== ERC20 транзакции ==========
-                        # ИСПРАВЛЕНИЕ #1: НЕ фильтруем по tx.to!
-                        # Получаем receipt и парсим логи напрямую
+                        # Пропускаем contract creation
+                        if not tx_to:
+                            continue
+                        
                         try:
                             tx_receipt = w3.eth.get_transaction_receipt(tx_hash)
                             
+                            # Пропускаем неуспешные и без логов
                             if tx_receipt.status == 0 or not tx_receipt.logs:
                                 continue
                             
-                            # ИСПРАВЛЕНИЕ #2: парсим логи за ОДИН проход
+                            # Парсим логи за ОДИН проход
                             transfers = parse_transfer_events_from_logs(
                                 tx_receipt.logs,
                                 wallet_addresses_dict,
@@ -593,12 +608,14 @@ async def monitor_new_blocks():
                         except Exception as e:
                             continue
                     
-                    # ИСПРАВЛЕНИЕ #3: сохраняем last_block после каждого блока
+                    # Обновляем last_block после каждого блока
                     db.update_last_block(block_num)
                 
-                last_block = current_block
+                last_block = last_block + blocks_to_process
+                
+                # Сохраняем после обработки пачки
+                db.save()
             
-            # ИСПРАВЛЕНИЕ #4: уменьшили sleep до 10 секунд
             await asyncio.sleep(10)
             
         except Exception as e:
