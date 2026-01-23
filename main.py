@@ -200,16 +200,18 @@ class SimpleDB:
             logger.error(f"Ошибка удаления кошелька: {e}")
             return False, None
     
-    def mark_processed(self, tx_hash, wallet_address):
-        key = f"{tx_hash}:{wallet_address.lower()}"
+    def mark_processed(self, tx_hash, wallet_address, token_symbol, direction):
+        """Помечаем конкретную комбинацию tx:wallet:token:direction как обработанную"""
+        key = f"{tx_hash}:{wallet_address.lower()}:{token_symbol}:{direction}"
         self.processed_txs[key] = True
         
         if len(self.processed_txs) > 10000:
             keys = list(self.processed_txs.keys())
             self.processed_txs = {k: True for k in keys[-5000:]}
     
-    def is_processed(self, tx_hash, wallet_address):
-        key = f"{tx_hash}:{wallet_address.lower()}"
+    def is_processed(self, tx_hash, wallet_address, token_symbol, direction):
+        """Проверяем конкретную комбинацию"""
+        key = f"{tx_hash}:{wallet_address.lower()}:{token_symbol}:{direction}"
         return key in self.processed_txs
 
 db = SimpleDB()
@@ -496,13 +498,19 @@ async def monitor_new_blocks():
         await asyncio.sleep(5)
         logger.info("Ожидание добавления кошельков...")
     
-    # Устанавливаем начальный блок
+    # ИСПРАВЛЕНИЕ: устанавливаем начальный блок правильно
     if db.last_block:
         last_block = db.last_block
         logger.info(f"Восстановлен последний блок: {last_block}")
     else:
-        last_block = await asyncio.to_thread(get_current_block)
-        logger.info(f"Начальный блок: {last_block}")
+        # Берём МИНИМАЛЬНЫЙ блок из всех кошельков
+        min_block = min(w.get("added_at_block", 0) for w in db.wallets)
+        if min_block > 0:
+            last_block = min_block
+            logger.info(f"Начинаем с блока добавления кошелька: {last_block}")
+        else:
+            last_block = await asyncio.to_thread(get_current_block)
+            logger.info(f"Начальный блок (текущий): {last_block}")
     
     # Маппинг адресов токенов
     token_addresses_reverse = {}
@@ -516,9 +524,9 @@ async def monitor_new_blocks():
             
             if current_block > last_block:
                 blocks_count = current_block - last_block
-                blocks_to_process = min(blocks_count, 3)  # Обрабатываем максимум 3 блока за раз
+                blocks_to_process = min(blocks_count, 1)  # Обрабатываем по 1 блоку для максимальной отзывчивости
                 
-                if blocks_count > 3:
+                if blocks_count > 1:
                     logger.info(f"Новых блоков: {blocks_count}, обрабатываем: {blocks_to_process}")
                 
                 for block_num in range(last_block + 1, last_block + blocks_to_process + 1):
@@ -547,6 +555,11 @@ async def monitor_new_blocks():
                                 if tx_to == wallet_addr:
                                     amount = w3.from_wei(tx.value, 'ether')
                                     
+                                    if db.is_processed(tx_hash, wallet_data["address"], "BNB", "IN"):
+                                        continue
+                                    
+                                    logger.info(f"🟢 Найден Transfer: BNB IN {float(amount)} для {wallet_data['name']}")
+                                    
                                     await send_transaction_alert(
                                         wallet_name=wallet_data["name"],
                                         wallet_address=wallet_data["address"],
@@ -558,10 +571,15 @@ async def monitor_new_blocks():
                                         tx_hash=tx_hash
                                     )
                                     
-                                    db.mark_processed(tx_hash, wallet_data["address"])
+                                    db.mark_processed(tx_hash, wallet_data["address"], "BNB", "IN")
                                 
                                 elif tx_from == wallet_addr:
                                     amount = w3.from_wei(tx.value, 'ether')
+                                    
+                                    if db.is_processed(tx_hash, wallet_data["address"], "BNB", "OUT"):
+                                        continue
+                                    
+                                    logger.info(f"🔴 Найден Transfer: BNB OUT {float(amount)} для {wallet_data['name']}")
                                     
                                     await send_transaction_alert(
                                         wallet_name=wallet_data["name"],
@@ -574,7 +592,7 @@ async def monitor_new_blocks():
                                         tx_hash=tx_hash
                                     )
                                     
-                                    db.mark_processed(tx_hash, wallet_data["address"])
+                                    db.mark_processed(tx_hash, wallet_data["address"], "BNB", "OUT")
                         
                         # ERC20 транзакции
                         if not tx_to:
@@ -594,8 +612,10 @@ async def monitor_new_blocks():
                             )
                             
                             for transfer in transfers:
-                                if db.is_processed(tx_hash, transfer["wallet_address"]):
+                                if db.is_processed(tx_hash, transfer["wallet_address"], transfer["token_symbol"], transfer["direction"]):
                                     continue
+                                
+                                logger.info(f"{'🟢' if transfer['direction'] == 'IN' else '🔴'} Найден Transfer: {transfer['token_symbol']} {transfer['direction']} {transfer['amount']} для {transfer['wallet_name']}")
                                 
                                 await send_transaction_alert(
                                     wallet_name=transfer["wallet_name"],
@@ -608,7 +628,7 @@ async def monitor_new_blocks():
                                     tx_hash=tx_hash
                                 )
                                 
-                                db.mark_processed(tx_hash, transfer["wallet_address"])
+                                db.mark_processed(tx_hash, transfer["wallet_address"], transfer["token_symbol"], transfer["direction"])
                                 
                         except Exception as e:
                             continue
