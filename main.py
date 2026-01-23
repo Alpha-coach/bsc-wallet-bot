@@ -48,6 +48,10 @@ TOKENS = {
     "BTCB": {
         "address": "0x7130d2A12B9BCbFAe4f2634d864A1Ee1Ce3Ead9c",
         "decimals": 18
+    },
+    "MEC": {
+        "address": "0x9a79D9C9e521cb900D2584c74bb41997EB7BF49f",
+        "decimals": 18
     }
 }
 
