@@ -230,10 +230,16 @@ def format_address(address):
     return f"{address[:6]}...{address[-4:]}"
 
 def format_balance(amount):
-    if amount >= 1:
+    """Форматировать баланс с учётом размера суммы"""
+    if amount == 0:
+        return "0.0000"
+    elif amount >= 1:
         return f"{amount:,.2f}"
-    else:
+    elif amount >= 0.0001:
         return f"{amount:.4f}"
+    else:
+        # Для очень мелких сумм показываем больше знаков
+        return f"{amount:.8f}"
 
 def is_authorized(user_id: int) -> bool:
     return user_id == TELEGRAM_USER_ID
@@ -406,10 +412,10 @@ async def send_transaction_alert(wallet_name, wallet_address, token_symbol, amou
             disable_web_page_preview=True
         )
         
-        logger.info(f"Уведомление: {direction} {amount} {token_symbol}{usd_amount}")
+        logger.info(f"Уведомление отправлено: {direction} {amount} {token_symbol}{usd_amount} для {wallet_name}")
         
     except Exception as e:
-        logger.error(f"Ошибка отправки: {e}")
+        logger.error(f"Ошибка отправки уведомления: {e}")
 
 async def process_transaction(tx_hash, wallet_address, wallet_name):
     try:
@@ -428,6 +434,7 @@ async def process_transaction(tx_hash, wallet_address, wallet_name):
             return
         
         wallet_address_lower = wallet_address.lower()
+        transaction_processed = False
         
         # Обработка нативных BNB транзакций
         if tx.value > 0:
@@ -449,8 +456,7 @@ async def process_transaction(tx_hash, wallet_address, wallet_name):
                     tx_hash=tx_hash
                 )
                 
-                db.mark_processed(tx_hash)
-                return
+                transaction_processed = True
             
             elif from_addr == wallet_address_lower:
                 amount = w3.from_wei(tx.value, 'ether')
@@ -467,76 +473,77 @@ async def process_transaction(tx_hash, wallet_address, wallet_name):
                     tx_hash=tx_hash
                 )
                 
-                db.mark_processed(tx_hash)
-                return
+                transaction_processed = True
         
-        # Обработка ERC20 токенов
-        # КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: проверяем каждый токен отдельно
+        # Обработка ERC20 токенов - проверяем ВСЕ токены на наличие Transfer событий
         for token_symbol, token_info in TOKENS.items():
             if token_symbol == "BNB":
                 continue
             
             token_address = Web3.to_checksum_address(token_info["address"])
-            
-            # ПРОВЕРЯЕМ: связана ли транзакция с этим конкретным токеном
-            if tx['to'] and tx['to'].lower() != token_address.lower():
-                continue  # Эта транзакция не к этому токену
-            
             contract = w3.eth.contract(address=token_address, abi=ERC20_ABI)
             
             try:
                 transfer_events = contract.events.Transfer().process_receipt(tx_receipt)
+                
+                if not transfer_events:
+                    continue
+                
+                # Проходим по всем Transfer событиям для этого токена
+                for event in transfer_events:
+                    from_addr = event['args']['from'].lower()
+                    to_addr = event['args']['to'].lower()
+                    value = event['args']['value']
+                    
+                    # Проверяем только события, где участвует наш кошелёк
+                    if to_addr == wallet_address_lower:
+                        amount = value / (10 ** token_info["decimals"])
+                        logger.info(f"Найдена входящая {token_symbol} транзакция: {amount} {token_symbol}")
+                        
+                        await send_transaction_alert(
+                            wallet_name=wallet_name,
+                            wallet_address=wallet_address,
+                            token_symbol=token_symbol,
+                            amount=amount,
+                            direction="IN",
+                            from_addr=event['args']['from'],
+                            to_addr=wallet_address,
+                            tx_hash=tx_hash
+                        )
+                        
+                        transaction_processed = True
+                    
+                    elif from_addr == wallet_address_lower:
+                        amount = value / (10 ** token_info["decimals"])
+                        logger.info(f"Найдена исходящая {token_symbol} транзакция: {amount} {token_symbol}")
+                        
+                        await send_transaction_alert(
+                            wallet_name=wallet_name,
+                            wallet_address=wallet_address,
+                            token_symbol=token_symbol,
+                            amount=amount,
+                            direction="OUT",
+                            from_addr=wallet_address,
+                            to_addr=event['args']['to'],
+                            tx_hash=tx_hash
+                        )
+                        
+                        transaction_processed = True
+                        
             except Exception as e:
-                logger.debug(f"Нет Transfer событий для {token_symbol}: {e}")
+                logger.debug(f"Нет Transfer событий для {token_symbol} в транзакции {tx_hash}: {e}")
                 continue
-            
-            for event in transfer_events:
-                from_addr = event['args']['from'].lower()
-                to_addr = event['args']['to'].lower()
-                value = event['args']['value']
-                
-                if to_addr == wallet_address_lower:
-                    amount = value / (10 ** token_info["decimals"])
-                    logger.info(f"Найдена входящая {token_symbol} транзакция: {amount} {token_symbol}")
-                    
-                    await send_transaction_alert(
-                        wallet_name=wallet_name,
-                        wallet_address=wallet_address,
-                        token_symbol=token_symbol,
-                        amount=amount,
-                        direction="IN",
-                        from_addr=event['args']['from'],
-                        to_addr=wallet_address,
-                        tx_hash=tx_hash
-                    )
-                    
-                    db.mark_processed(tx_hash)
-                    return  # ВАЖНО: выходим после первого найденного события
-                
-                elif from_addr == wallet_address_lower:
-                    amount = value / (10 ** token_info["decimals"])
-                    logger.info(f"Найдена исходящая {token_symbol} транзакция: {amount} {token_symbol}")
-                    
-                    await send_transaction_alert(
-                        wallet_name=wallet_name,
-                        wallet_address=wallet_address,
-                        token_symbol=token_symbol,
-                        amount=amount,
-                        direction="OUT",
-                        from_addr=wallet_address,
-                        to_addr=event['args']['to'],
-                        tx_hash=tx_hash
-                    )
-                    
-                    db.mark_processed(tx_hash)
-                    return  # ВАЖНО: выходим после первого найденного события
         
-        # Если дошли сюда - транзакция не связана с нашими токенами
-        logger.debug(f"Транзакция {tx_hash} не содержит релевантных Transfer событий")
+        # Отмечаем транзакцию как обработанную
+        if transaction_processed:
+            logger.info(f"Транзакция {tx_hash} успешно обработана и отмечена")
+        else:
+            logger.debug(f"Транзакция {tx_hash} не содержит релевантных событий для кошелька {wallet_name}")
+        
         db.mark_processed(tx_hash)
                     
     except Exception as e:
-        logger.error(f"Ошибка обработки tx {tx_hash}: {e}", exc_info=True)
+        logger.error(f"Ошибка обработки транзакции {tx_hash}: {e}", exc_info=True)
 
 async def monitor_new_blocks():
     logger.info("Мониторинг блоков запущен")
@@ -550,11 +557,11 @@ async def monitor_new_blocks():
             
             if current_block > last_block:
                 blocks_to_process = current_block - last_block
-                logger.info(f"Новых блоков: {blocks_to_process} (с {last_block + 1} по {current_block})")
+                logger.info(f"Обнаружено новых блоков: {blocks_to_process} (с {last_block + 1} по {current_block})")
                 
                 for block_num in range(last_block + 1, current_block + 1):
                     block = w3.eth.get_block(block_num, full_transactions=True)
-                    logger.debug(f"Обработка блока {block_num}, транзакций: {len(block.transactions)}")
+                    logger.debug(f"Обработка блока {block_num}, транзакций в блоке: {len(block.transactions)}")
                     
                     for tx in block.transactions:
                         tx_hash = tx.hash.hex()
