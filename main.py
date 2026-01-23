@@ -6,6 +6,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.filters import Command
 from aiogram.types import Message
 from web3 import Web3
+from web3.middleware import geth_poa_middleware
 import json
 
 logging.basicConfig(
@@ -21,6 +22,7 @@ BNB_RPC = os.getenv("BNB_RPC", "https://bsc-dataseed.binance.org/")
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 w3 = Web3(Web3.HTTPProvider(BNB_RPC))
+w3.middleware_onion.inject(geth_poa_middleware, layer=0)
 
 TOKENS = {
     "BNB": {
