@@ -549,9 +549,6 @@ async def monitor_new_blocks():
                         # BNB транзакции
                         if tx.value > 0:
                             for wallet_addr, wallet_data in wallet_addresses_dict.items():
-                                if db.is_processed(tx_hash, wallet_data["address"]):
-                                    continue
-                                
                                 if tx_to == wallet_addr:
                                     amount = w3.from_wei(tx.value, 'ether')
                                     
