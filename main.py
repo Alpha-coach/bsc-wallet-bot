@@ -416,7 +416,7 @@ async def monitor_new_blocks():
                 
                 last_block = current_block
             
-            await asyncio.sleep(3)
+            await asyncio.sleep(45)
             
         except Exception as e:
             logger.error(f"Ошибка мониторинга: {e}")
