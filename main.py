@@ -65,7 +65,6 @@ TOKENS = {
     }
 }
 
-# Transfer event signature
 TRANSFER_EVENT_SIGNATURE = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 
 ERC20_ABI = [
@@ -164,7 +163,6 @@ class SimpleDB:
     
     def update_last_block(self, block_num):
         self.last_block = block_num
-        # Сохраняем каждые 10 блоков для производительности
         if block_num % 10 == 0:
             self.save()
     
@@ -181,6 +179,11 @@ class SimpleDB:
                 return False
         
         self.wallets.append(wallet)
+        
+        # Устанавливаем last_block на блок добавления кошелька
+        if self.last_block is None or current_block < self.last_block:
+            self.last_block = current_block
+        
         self.save()
         logger.info(f"Кошелёк добавлен с блока {current_block}")
         return True
@@ -211,7 +214,8 @@ class SimpleDB:
 
 db = SimpleDB()
 
-def get_balance(address, token_symbol):
+# Синхронные функции для Web3 (будут вызваны через asyncio.to_thread)
+def get_balance_sync(address, token_symbol):
     try:
         address = Web3.to_checksum_address(address)
         
@@ -229,6 +233,10 @@ def get_balance(address, token_symbol):
     except Exception as e:
         logger.error(f"Ошибка получения баланса {token_symbol}: {e}")
         return 0.0
+
+async def get_balance(address, token_symbol):
+    """Асинхронная обёртка для get_balance"""
+    return await asyncio.to_thread(get_balance_sync, address, token_symbol)
 
 def format_address(address):
     if not address:
@@ -281,7 +289,7 @@ async def cmd_balance(message: Message):
         
         balances = {}
         for token in TOKENS.keys():
-            balances[token] = get_balance(address, token)
+            balances[token] = await get_balance(address, token)
         
         msg = f"Баланс: {name}\n"
         msg += f"{format_address(address)}\n\n"
@@ -385,14 +393,8 @@ async def send_transaction_alert(wallet_name, wallet_address, token_symbol, amou
     try:
         await get_token_prices()
         
-        if direction == "IN":
-            emoji = "🟢"
-        else:
-            emoji = "🔴"
-        
-        new_balance = get_balance(wallet_address, token_symbol)
+        emoji = "🟢" if direction == "IN" else "🔴"
         usd_amount = format_usd(amount, token_symbol)
-        usd_balance = format_usd(new_balance, token_symbol)
         
         msg = f"{emoji} {direction} | {format_balance(amount)} {token_symbol}{usd_amount}\n"
         msg += f"Кошелёк: {wallet_name}\n"
@@ -402,7 +404,6 @@ async def send_transaction_alert(wallet_name, wallet_address, token_symbol, amou
         else:
             msg += f"To: {format_address(to_addr)}\n"
         
-        msg += f"Новый баланс: {format_balance(new_balance)} {token_symbol}{usd_balance}\n"
         msg += f"<a href='https://bscscan.com/tx/{tx_hash}'>Tx</a>"
         
         await bot.send_message(
@@ -418,15 +419,12 @@ async def send_transaction_alert(wallet_name, wallet_address, token_symbol, amou
         logger.error(f"Ошибка отправки: {e}")
 
 def parse_transfer_events_from_logs(logs, wallet_addresses_dict, token_addresses_reverse):
-    """
-    Парсим Transfer события напрямую из logs за ОДИН проход
-    """
     transfers = []
     
     for log in logs:
         try:
-            # Проверяем что это Transfer event
-            if len(log['topics']) != 3:
+            # Проверяем что это Transfer event (минимум 3 topics)
+            if len(log['topics']) < 3:
                 continue
             
             if log['topics'][0].hex() != TRANSFER_EVENT_SIGNATURE:
@@ -480,17 +478,30 @@ def parse_transfer_events_from_logs(logs, wallet_addresses_dict, token_addresses
     
     return transfers
 
+# Синхронные функции для мониторинга
+def get_current_block():
+    return w3.eth.block_number
+
+def get_block_with_transactions(block_num):
+    return w3.eth.get_block(block_num, full_transactions=True)
+
+def get_transaction_receipt(tx_hash):
+    return w3.eth.get_transaction_receipt(tx_hash)
+
 async def monitor_new_blocks():
-    """
-    ОПТИМИЗИРОВАННЫЙ мониторинг
-    """
     logger.info("Мониторинг запущен")
     
+    # Ждём пока будет хотя бы один кошелёк
+    while not db.wallets:
+        await asyncio.sleep(5)
+        logger.info("Ожидание добавления кошельков...")
+    
+    # Устанавливаем начальный блок
     if db.last_block:
         last_block = db.last_block
         logger.info(f"Восстановлен последний блок: {last_block}")
     else:
-        last_block = w3.eth.block_number
+        last_block = await asyncio.to_thread(get_current_block)
         logger.info(f"Начальный блок: {last_block}")
     
     # Маппинг адресов токенов
@@ -501,27 +512,23 @@ async def monitor_new_blocks():
     
     while True:
         try:
-            current_block = w3.eth.block_number
+            current_block = await asyncio.to_thread(get_current_block)
             
             if current_block > last_block:
                 blocks_count = current_block - last_block
+                blocks_to_process = min(blocks_count, 3)  # Обрабатываем максимум 3 блока за раз
                 
-                # ОПТИМИЗАЦИЯ: максимум 5 блоков за раз
-                blocks_to_process = min(blocks_count, 5)
-                
-                if blocks_count > 5:
+                if blocks_count > 3:
                     logger.info(f"Новых блоков: {blocks_count}, обрабатываем: {blocks_to_process}")
-                else:
-                    logger.info(f"Новых блоков: {blocks_to_process}")
                 
                 for block_num in range(last_block + 1, last_block + blocks_to_process + 1):
-                    block = w3.eth.get_block(block_num, full_transactions=True)
+                    # Асинхронный вызов получения блока
+                    block = await asyncio.to_thread(get_block_with_transactions, block_num)
                     
                     wallet_addresses_dict = {
                         w["address"].lower(): w for w in db.wallets
                     }
                     
-                    # Если нет кошельков - пропускаем блок
                     if not wallet_addresses_dict:
                         db.update_last_block(block_num)
                         continue
@@ -531,7 +538,7 @@ async def monitor_new_blocks():
                         tx_from = tx['from'].lower()
                         tx_to = tx['to'].lower() if tx['to'] else ""
                         
-                        # ========== BNB транзакции ==========
+                        # BNB транзакции
                         if tx.value > 0:
                             for wallet_addr, wallet_data in wallet_addresses_dict.items():
                                 if db.is_processed(tx_hash, wallet_data["address"]):
@@ -569,19 +576,17 @@ async def monitor_new_blocks():
                                     
                                     db.mark_processed(tx_hash, wallet_data["address"])
                         
-                        # ========== ERC20 транзакции ==========
-                        # Пропускаем contract creation
+                        # ERC20 транзакции
                         if not tx_to:
                             continue
                         
                         try:
-                            tx_receipt = w3.eth.get_transaction_receipt(tx_hash)
+                            # Асинхронный вызов получения receipt
+                            tx_receipt = await asyncio.to_thread(get_transaction_receipt, tx_hash)
                             
-                            # Пропускаем неуспешные и без логов
                             if tx_receipt.status == 0 or not tx_receipt.logs:
                                 continue
                             
-                            # Парсим логи за ОДИН проход
                             transfers = parse_transfer_events_from_logs(
                                 tx_receipt.logs,
                                 wallet_addresses_dict,
@@ -608,25 +613,25 @@ async def monitor_new_blocks():
                         except Exception as e:
                             continue
                     
-                    # Обновляем last_block после каждого блока
                     db.update_last_block(block_num)
                 
                 last_block = last_block + blocks_to_process
-                
-                # Сохраняем после обработки пачки
                 db.save()
             
-            await asyncio.sleep(10)
+            await asyncio.sleep(5)  # Уменьшил с 10 до 5 секунд для быстрой реакции
             
         except Exception as e:
             logger.error(f"Ошибка мониторинга: {e}")
-            await asyncio.sleep(30)
+            await asyncio.sleep(15)
 
 async def main():
     logger.info("Бот запускается")
     
-    if w3.is_connected():
-        logger.info(f"BSC подключен (блок: {w3.eth.block_number})")
+    # Проверка подключения к BSC
+    is_connected = await asyncio.to_thread(w3.is_connected)
+    if is_connected:
+        block_num = await asyncio.to_thread(get_current_block)
+        logger.info(f"BSC подключен (блок: {block_num})")
     else:
         logger.error("Ошибка подключения к BSC")
         return
@@ -635,6 +640,7 @@ async def main():
     
     logger.info(f"Загружено кошельков: {len(db.wallets)}")
     
+    # Запускаем мониторинг и бота параллельно
     asyncio.create_task(monitor_new_blocks())
     await dp.start_polling(bot)
 
