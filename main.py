@@ -2,7 +2,6 @@ import os
 import asyncio
 import logging
 import warnings
-import time
 from datetime import datetime, timezone
 from aiogram import Bot, Dispatcher
 from aiogram.filters import Command
@@ -23,10 +22,6 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 TELEGRAM_USER_ID = int(os.getenv("TELEGRAM_USER_ID"))
 BNB_RPC = os.getenv("BNB_RPC", "https://bsc-dataseed.binance.org/")
-
-# Настройки безопасности
-CONFIRMATIONS = 3  # Защита от reorg
-PROCESSED_TX_TTL = 86400  # 24 часа хранения
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -136,7 +131,7 @@ def format_usd(amount, token_symbol):
 class SimpleDB:
     def __init__(self):
         self.wallets = []
-        self.processed_txs = {}  # УЛУЧШЕНИЕ: теперь с timestamp
+        self.processed_txs = {}
         self.last_block = None
         self.load()
     
@@ -148,17 +143,11 @@ class SimpleDB:
                     self.wallets = data.get("wallets", [])
                     self.last_block = data.get("last_block", None)
                     
-                    # Загружаем processed_txs с очисткой старых
-                    processed_data = data.get("processed_txs", {})
-                    current_time = time.time()
-                    
-                    # Фильтруем только свежие (последние 24 часа)
-                    self.processed_txs = {
-                        k: v for k, v in processed_data.items()
-                        if isinstance(v, dict) and current_time - v.get("ts", 0) < PROCESSED_TX_TTL
-                    }
-                    
-                    logger.info(f"Загружено {len(self.processed_txs)} обработанных tx")
+                    processed_list = data.get("processed_txs", [])
+                    if isinstance(processed_list, list):
+                        self.processed_txs = {tx: True for tx in processed_list}
+                    else:
+                        self.processed_txs = processed_list
         except Exception as e:
             logger.error(f"Ошибка загрузки БД: {e}")
     
@@ -167,7 +156,7 @@ class SimpleDB:
             with open("data.json", "w") as f:
                 json.dump({
                     "wallets": self.wallets,
-                    "processed_txs": self.processed_txs,
+                    "processed_txs": list(self.processed_txs.keys()),
                     "last_block": self.last_block
                 }, f, indent=2)
         except Exception as e:
@@ -175,6 +164,7 @@ class SimpleDB:
     
     def update_last_block(self, block_num):
         self.last_block = block_num
+        # Сохраняем каждые 10 блоков для производительности
         if block_num % 10 == 0:
             self.save()
     
@@ -207,21 +197,13 @@ class SimpleDB:
             logger.error(f"Ошибка удаления кошелька: {e}")
             return False, None
     
-    def mark_processed(self, tx_hash, wallet_address, block_num):
-        """УЛУЧШЕНИЕ: сохраняем с timestamp и block"""
+    def mark_processed(self, tx_hash, wallet_address):
         key = f"{tx_hash}:{wallet_address.lower()}"
-        self.processed_txs[key] = {
-            "block": block_num,
-            "ts": time.time()
-        }
+        self.processed_txs[key] = True
         
-        # Очистка старых записей
         if len(self.processed_txs) > 10000:
-            current_time = time.time()
-            self.processed_txs = {
-                k: v for k, v in self.processed_txs.items()
-                if current_time - v["ts"] < PROCESSED_TX_TTL
-            }
+            keys = list(self.processed_txs.keys())
+            self.processed_txs = {k: True for k in keys[-5000:]}
     
     def is_processed(self, tx_hash, wallet_address):
         key = f"{tx_hash}:{wallet_address.lower()}"
@@ -435,25 +417,22 @@ async def send_transaction_alert(wallet_name, wallet_address, token_symbol, amou
     except Exception as e:
         logger.error(f"Ошибка отправки: {e}")
 
-def has_relevant_logs(logs, token_addresses_set):
-    """УЛУЧШЕНИЕ #1: быстрая проверка перед парсингом"""
-    for log in logs:
-        if log['address'].lower() in token_addresses_set:
-            return True
-    return False
-
 def parse_transfer_events_from_logs(logs, wallet_addresses_dict, token_addresses_reverse):
-    """Парсим Transfer события напрямую из logs за ОДИН проход"""
+    """
+    Парсим Transfer события напрямую из logs за ОДИН проход
+    """
     transfers = []
     
     for log in logs:
         try:
+            # Проверяем что это Transfer event
             if len(log['topics']) != 3:
                 continue
             
             if log['topics'][0].hex() != TRANSFER_EVENT_SIGNATURE:
                 continue
             
+            # Проверяем что это наш токен
             token_address = log['address'].lower()
             if token_address not in token_addresses_reverse:
                 continue
@@ -461,15 +440,18 @@ def parse_transfer_events_from_logs(logs, wallet_addresses_dict, token_addresses
             token_symbol = token_addresses_reverse[token_address]
             token_info = TOKENS[token_symbol]
             
+            # Декодируем from/to из topics
             from_addr = '0x' + log['topics'][1].hex()[-40:]
             to_addr = '0x' + log['topics'][2].hex()[-40:]
             
             from_addr = from_addr.lower()
             to_addr = to_addr.lower()
             
+            # Декодируем value из data
             value = int(log['data'].hex(), 16)
             amount = value / (10 ** token_info["decimals"])
             
+            # Проверяем участвует ли наш кошелёк
             if to_addr in wallet_addresses_dict:
                 wallet_data = wallet_addresses_dict[to_addr]
                 transfers.append({
@@ -499,7 +481,9 @@ def parse_transfer_events_from_logs(logs, wallet_addresses_dict, token_addresses
     return transfers
 
 async def monitor_new_blocks():
-    """ФИНАЛЬНАЯ ВЕРСИЯ мониторинга"""
+    """
+    ОПТИМИЗИРОВАННЫЙ мониторинг
+    """
     logger.info("Мониторинг запущен")
     
     if db.last_block:
@@ -509,25 +493,20 @@ async def monitor_new_blocks():
         last_block = w3.eth.block_number
         logger.info(f"Начальный блок: {last_block}")
     
-    # Подготовка маппингов
+    # Маппинг адресов токенов
     token_addresses_reverse = {}
-    token_addresses_set = set()
-    
     for token_symbol, token_info in TOKENS.items():
         if token_info["address"]:
-            addr_lower = token_info["address"].lower()
-            token_addresses_reverse[addr_lower] = token_symbol
-            token_addresses_set.add(addr_lower)
+            token_addresses_reverse[token_info["address"].lower()] = token_symbol
     
     while True:
         try:
             current_block = w3.eth.block_number
             
-            # УЛУЧШЕНИЕ: защита от reorg - не обрабатываем последние 3 блока
-            safe_block = current_block - CONFIRMATIONS
-            
-            if safe_block > last_block:
-                blocks_count = safe_block - last_block
+            if current_block > last_block:
+                blocks_count = current_block - last_block
+                
+                # ОПТИМИЗАЦИЯ: максимум 5 блоков за раз
                 blocks_to_process = min(blocks_count, 5)
                 
                 if blocks_count > 5:
@@ -542,6 +521,7 @@ async def monitor_new_blocks():
                         w["address"].lower(): w for w in db.wallets
                     }
                     
+                    # Если нет кошельков - пропускаем блок
                     if not wallet_addresses_dict:
                         db.update_last_block(block_num)
                         continue
@@ -551,7 +531,7 @@ async def monitor_new_blocks():
                         tx_from = tx['from'].lower()
                         tx_to = tx['to'].lower() if tx['to'] else ""
                         
-                        # ========== BNB ==========
+                        # ========== BNB транзакции ==========
                         if tx.value > 0:
                             for wallet_addr, wallet_data in wallet_addresses_dict.items():
                                 if db.is_processed(tx_hash, wallet_data["address"]):
@@ -571,7 +551,7 @@ async def monitor_new_blocks():
                                         tx_hash=tx_hash
                                     )
                                     
-                                    db.mark_processed(tx_hash, wallet_data["address"], block_num)
+                                    db.mark_processed(tx_hash, wallet_data["address"])
                                 
                                 elif tx_from == wallet_addr:
                                     amount = w3.from_wei(tx.value, 'ether')
@@ -587,22 +567,21 @@ async def monitor_new_blocks():
                                         tx_hash=tx_hash
                                     )
                                     
-                                    db.mark_processed(tx_hash, wallet_data["address"], block_num)
+                                    db.mark_processed(tx_hash, wallet_data["address"])
                         
-                        # ========== ERC20 ==========
+                        # ========== ERC20 транзакции ==========
+                        # Пропускаем contract creation
                         if not tx_to:
                             continue
                         
                         try:
                             tx_receipt = w3.eth.get_transaction_receipt(tx_hash)
                             
+                            # Пропускаем неуспешные и без логов
                             if tx_receipt.status == 0 or not tx_receipt.logs:
                                 continue
                             
-                            # УЛУЧШЕНИЕ #1: быстрая проверка перед парсингом
-                            if not has_relevant_logs(tx_receipt.logs, token_addresses_set):
-                                continue
-                            
+                            # Парсим логи за ОДИН проход
                             transfers = parse_transfer_events_from_logs(
                                 tx_receipt.logs,
                                 wallet_addresses_dict,
@@ -624,14 +603,17 @@ async def monitor_new_blocks():
                                     tx_hash=tx_hash
                                 )
                                 
-                                db.mark_processed(tx_hash, transfer["wallet_address"], block_num)
+                                db.mark_processed(tx_hash, transfer["wallet_address"])
                                 
                         except Exception as e:
                             continue
                     
+                    # Обновляем last_block после каждого блока
                     db.update_last_block(block_num)
                 
                 last_block = last_block + blocks_to_process
+                
+                # Сохраняем после обработки пачки
                 db.save()
             
             await asyncio.sleep(10)
