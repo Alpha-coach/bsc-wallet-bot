@@ -245,6 +245,32 @@ async def send_transaction_alert(wallet_name, wallet_address, token_symbol, amou
     except Exception as e:
         logger.error(f"Ошибка отправки уведомления: {e}")
 
+async def get_bnb_transfers_bscscan(address, start_block):
+    try:
+        url = "https://api.bscscan.com/api"
+        params = {
+            "module": "account",
+            "action": "txlist",
+            "address": address,
+            "startblock": start_block,
+            "endblock": "latest",
+            "sort": "asc",
+            "apikey": BSCSCAN_API_KEY
+        }
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params) as response:
+                data = await response.json()
+                
+                if data["status"] == "1":
+                    return data["result"]
+                else:
+                    return []
+                    
+    except Exception as e:
+        logger.error(f"Ошибка BscScan API (BNB): {e}")
+        return []
+
 async def get_token_transfers_bscscan(address, token_address, start_block):
     try:
         url = "https://api.bscscan.com/api"
@@ -275,6 +301,56 @@ async def get_token_transfers_bscscan(address, token_address, start_block):
 async def check_wallet_transactions(wallet_address, wallet_name):
     try:
         wallet_address = Web3.to_checksum_address(wallet_address)
+        
+        bnb_transactions = await get_bnb_transfers_bscscan(
+            address=wallet_address,
+            start_block=db.last_block + 1
+        )
+        
+        for tx in bnb_transactions:
+            tx_hash = tx["hash"]
+            block_number = int(tx["blockNumber"])
+            
+            if block_number <= db.last_block:
+                continue
+            
+            if db.is_processed(tx_hash):
+                continue
+            
+            if tx["isError"] != "0":
+                continue
+            
+            from_addr = tx["from"]
+            to_addr = tx["to"]
+            value = int(tx["value"])
+            
+            if value == 0:
+                continue
+            
+            is_incoming = to_addr.lower() == wallet_address.lower()
+            is_outgoing = from_addr.lower() == wallet_address.lower()
+            
+            if not (is_incoming or is_outgoing):
+                continue
+            
+            amount = value / (10 ** 18)
+            
+            direction = "IN" if is_incoming else "OUT"
+            
+            await send_transaction_alert(
+                wallet_name=wallet_name,
+                wallet_address=wallet_address,
+                token_symbol="BNB",
+                amount=amount,
+                direction=direction,
+                from_addr=from_addr,
+                to_addr=to_addr,
+                tx_hash=tx_hash
+            )
+            
+            db.mark_processed(tx_hash)
+        
+        await asyncio.sleep(0.3)
         
         for token_symbol, token_info in TOKENS.items():
             if token_symbol == "BNB":
