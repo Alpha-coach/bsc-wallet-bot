@@ -290,6 +290,10 @@ async def check_wallet_transactions(wallet_address, wallet_name):
             
             for tx in transactions:
                 tx_hash = tx["hash"]
+                block_number = int(tx["blockNumber"])
+                
+                if block_number <= db.last_block:
+                    continue
                 
                 if db.is_processed(tx_hash):
                     continue
