@@ -65,6 +65,9 @@ TOKENS = {
     }
 }
 
+# Transfer event signature (keccak256("Transfer(address,address,uint256)"))
+TRANSFER_EVENT_SIGNATURE = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+
 ERC20_ABI = [
     {
         "constant": True,
@@ -72,16 +75,6 @@ ERC20_ABI = [
         "name": "balanceOf",
         "outputs": [{"name": "balance", "type": "uint256"}],
         "type": "function"
-    },
-    {
-        "anonymous": False,
-        "inputs": [
-            {"indexed": True, "name": "from", "type": "address"},
-            {"indexed": True, "name": "to", "type": "address"},
-            {"indexed": False, "name": "value", "type": "uint256"}
-        ],
-        "name": "Transfer",
-        "type": "event"
     }
 ]
 
@@ -138,7 +131,8 @@ def format_usd(amount, token_symbol):
 class SimpleDB:
     def __init__(self):
         self.wallets = []
-        self.processed_txs = {}  # Изменено: dict вместо set
+        self.processed_txs = {}
+        self.last_block = None  # ИСПРАВЛЕНИЕ #3: персистим last_block
         self.load()
     
     def load(self):
@@ -147,7 +141,8 @@ class SimpleDB:
                 with open("data.json", "r") as f:
                     data = json.load(f)
                     self.wallets = data.get("wallets", [])
-                    # Загружаем processed_txs как dict
+                    self.last_block = data.get("last_block", None)
+                    
                     processed_list = data.get("processed_txs", [])
                     if isinstance(processed_list, list):
                         self.processed_txs = {tx: True for tx in processed_list}
@@ -161,17 +156,23 @@ class SimpleDB:
             with open("data.json", "w") as f:
                 json.dump({
                     "wallets": self.wallets,
-                    "processed_txs": list(self.processed_txs.keys())
+                    "processed_txs": list(self.processed_txs.keys()),
+                    "last_block": self.last_block  # Сохраняем последний блок
                 }, f, indent=2)
         except Exception as e:
             logger.error(f"Ошибка сохранения БД: {e}")
+    
+    def update_last_block(self, block_num):
+        """Обновляем последний обработанный блок"""
+        self.last_block = block_num
+        self.save()
     
     def add_wallet(self, address, name="Main"):
         current_block = w3.eth.block_number
         wallet = {
             "address": address,
             "name": name,
-            "last_block": current_block
+            "added_at_block": current_block
         }
         
         for existing_wallet in self.wallets:
@@ -196,18 +197,15 @@ class SimpleDB:
             return False, None
     
     def mark_processed(self, tx_hash, wallet_address):
-        """Отмечаем tx для конкретного кошелька"""
         key = f"{tx_hash}:{wallet_address.lower()}"
         self.processed_txs[key] = True
         
         if len(self.processed_txs) > 10000:
-            # Оставляем последние 5000
             keys = list(self.processed_txs.keys())
             self.processed_txs = {k: True for k in keys[-5000:]}
         self.save()
     
     def is_processed(self, tx_hash, wallet_address):
-        """Проверяем обработана ли tx для конкретного кошелька"""
         key = f"{tx_hash}:{wallet_address.lower()}"
         return key in self.processed_txs
 
@@ -419,86 +417,99 @@ async def send_transaction_alert(wallet_name, wallet_address, token_symbol, amou
     except Exception as e:
         logger.error(f"Ошибка отправки: {e}")
 
-async def check_erc20_transfers_in_transaction(tx_receipt, wallet_addresses_dict):
+def parse_transfer_events_from_logs(logs, wallet_addresses_dict, token_addresses_reverse):
     """
-    Проверяет Transfer события в транзакции для всех наших токенов и кошельков
-    Возвращает список найденных переводов
+    ИСПРАВЛЕНИЕ #1 и #2: 
+    Парсим Transfer события напрямую из logs за ОДИН проход
+    Не фильтруем по tx.to - ловим ВСЕ Transfer события
     """
-    found_transfers = []
+    transfers = []
     
-    for token_symbol, token_info in TOKENS.items():
-        if token_symbol == "BNB":
+    for log in logs:
+        # Проверяем что это Transfer event
+        if len(log['topics']) != 3:
             continue
         
-        try:
-            token_address = Web3.to_checksum_address(token_info["address"])
-            contract = w3.eth.contract(address=token_address, abi=ERC20_ABI)
-            
-            transfer_events = contract.events.Transfer().process_receipt(tx_receipt)
-            
-            for event in transfer_events:
-                from_addr = event['args']['from'].lower()
-                to_addr = event['args']['to'].lower()
-                value = event['args']['value']
-                
-                # Проверяем участвует ли какой-то наш кошелёк
-                for wallet_addr, wallet_data in wallet_addresses_dict.items():
-                    if to_addr == wallet_addr:
-                        amount = value / (10 ** token_info["decimals"])
-                        found_transfers.append({
-                            "wallet_address": wallet_data["address"],
-                            "wallet_name": wallet_data["name"],
-                            "token_symbol": token_symbol,
-                            "amount": amount,
-                            "direction": "IN",
-                            "from_addr": event['args']['from'],
-                            "to_addr": wallet_data["address"]
-                        })
-                    
-                    elif from_addr == wallet_addr:
-                        amount = value / (10 ** token_info["decimals"])
-                        found_transfers.append({
-                            "wallet_address": wallet_data["address"],
-                            "wallet_name": wallet_data["name"],
-                            "token_symbol": token_symbol,
-                            "amount": amount,
-                            "direction": "OUT",
-                            "from_addr": wallet_data["address"],
-                            "to_addr": event['args']['to']
-                        })
-        except:
+        if log['topics'][0].hex() != TRANSFER_EVENT_SIGNATURE:
             continue
+        
+        # Проверяем что это наш токен
+        token_address = log['address'].lower()
+        if token_address not in token_addresses_reverse:
+            continue
+        
+        token_symbol = token_addresses_reverse[token_address]
+        token_info = TOKENS[token_symbol]
+        
+        # Декодируем from/to из topics
+        from_addr = '0x' + log['topics'][1].hex()[-40:]
+        to_addr = '0x' + log['topics'][2].hex()[-40:]
+        
+        from_addr = from_addr.lower()
+        to_addr = to_addr.lower()
+        
+        # Декодируем value из data
+        value = int(log['data'].hex(), 16)
+        amount = value / (10 ** token_info["decimals"])
+        
+        # Проверяем участвует ли наш кошелёк
+        if to_addr in wallet_addresses_dict:
+            wallet_data = wallet_addresses_dict[to_addr]
+            transfers.append({
+                "wallet_address": wallet_data["address"],
+                "wallet_name": wallet_data["name"],
+                "token_symbol": token_symbol,
+                "amount": amount,
+                "direction": "IN",
+                "from_addr": '0x' + log['topics'][1].hex()[-40:],
+                "to_addr": wallet_data["address"]
+            })
+        
+        elif from_addr in wallet_addresses_dict:
+            wallet_data = wallet_addresses_dict[from_addr]
+            transfers.append({
+                "wallet_address": wallet_data["address"],
+                "wallet_name": wallet_data["name"],
+                "token_symbol": token_symbol,
+                "amount": amount,
+                "direction": "OUT",
+                "from_addr": wallet_data["address"],
+                "to_addr": '0x' + log['topics'][2].hex()[-40:]
+            })
     
-    return found_transfers
+    return transfers
 
 async def monitor_new_blocks():
     """
-    ПРАВИЛЬНЫЙ мониторинг:
-    1. BNB - через прямую проверку tx.from/tx.to
-    2. ERC20 - через проверку ВСЕХ транзакций к контрактам токенов
+    ПРОДАКШН мониторинг с исправлениями #1-#4
     """
     logger.info("Мониторинг запущен")
     
-    last_block = w3.eth.block_number
-    logger.info(f"Начальный блок: {last_block}")
+    # ИСПРАВЛЕНИЕ #3: используем сохранённый last_block
+    if db.last_block:
+        last_block = db.last_block
+        logger.info(f"Восстановлен последний блок: {last_block}")
+    else:
+        last_block = w3.eth.block_number
+        logger.info(f"Начальный блок: {last_block}")
     
-    # Подготовка: адреса контрактов токенов
-    token_contract_addresses = set()
-    for token_info in TOKENS.values():
+    # Подготовка: маппинг адресов токенов
+    token_addresses_reverse = {}
+    for token_symbol, token_info in TOKENS.items():
         if token_info["address"]:
-            token_contract_addresses.add(token_info["address"].lower())
+            token_addresses_reverse[token_info["address"].lower()] = token_symbol
     
     while True:
         try:
             current_block = w3.eth.block_number
             
             if current_block > last_block:
-                logger.info(f"Новых блоков: {current_block - last_block}")
+                blocks_count = current_block - last_block
+                logger.info(f"Новых блоков: {blocks_count}")
                 
                 for block_num in range(last_block + 1, current_block + 1):
                     block = w3.eth.get_block(block_num, full_transactions=True)
                     
-                    # Словарь кошельков для быстрого поиска
                     wallet_addresses_dict = {
                         w["address"].lower(): w for w in db.wallets
                     }
@@ -508,14 +519,13 @@ async def monitor_new_blocks():
                         tx_from = tx['from'].lower()
                         tx_to = tx['to'].lower() if tx['to'] else ""
                         
-                        # ========== ПРОВЕРКА BNB ==========
+                        # ========== BNB транзакции ==========
                         if tx.value > 0:
                             for wallet_addr, wallet_data in wallet_addresses_dict.items():
                                 if db.is_processed(tx_hash, wallet_data["address"]):
                                     continue
                                 
                                 if tx_to == wallet_addr:
-                                    # Входящий BNB
                                     amount = w3.from_wei(tx.value, 'ether')
                                     
                                     await send_transaction_alert(
@@ -532,7 +542,6 @@ async def monitor_new_blocks():
                                     db.mark_processed(tx_hash, wallet_data["address"])
                                 
                                 elif tx_from == wallet_addr:
-                                    # Исходящий BNB
                                     amount = w3.from_wei(tx.value, 'ether')
                                     
                                     await send_transaction_alert(
@@ -548,45 +557,49 @@ async def monitor_new_blocks():
                                     
                                     db.mark_processed(tx_hash, wallet_data["address"])
                         
-                        # ========== ПРОВЕРКА ERC20 ==========
-                        # Если tx.to = адрес контракта токена → проверяем Transfer события
-                        if tx_to in token_contract_addresses:
-                            try:
-                                tx_receipt = w3.eth.get_transaction_receipt(tx_hash)
-                                
-                                if tx_receipt.status == 0:
+                        # ========== ERC20 транзакции ==========
+                        # ИСПРАВЛЕНИЕ #1: НЕ фильтруем по tx.to!
+                        # Получаем receipt и парсим логи напрямую
+                        try:
+                            tx_receipt = w3.eth.get_transaction_receipt(tx_hash)
+                            
+                            if tx_receipt.status == 0 or not tx_receipt.logs:
+                                continue
+                            
+                            # ИСПРАВЛЕНИЕ #2: парсим логи за ОДИН проход
+                            transfers = parse_transfer_events_from_logs(
+                                tx_receipt.logs,
+                                wallet_addresses_dict,
+                                token_addresses_reverse
+                            )
+                            
+                            for transfer in transfers:
+                                if db.is_processed(tx_hash, transfer["wallet_address"]):
                                     continue
                                 
-                                # Ищем Transfer события для наших кошельков
-                                transfers = await check_erc20_transfers_in_transaction(
-                                    tx_receipt, 
-                                    wallet_addresses_dict
+                                await send_transaction_alert(
+                                    wallet_name=transfer["wallet_name"],
+                                    wallet_address=transfer["wallet_address"],
+                                    token_symbol=transfer["token_symbol"],
+                                    amount=transfer["amount"],
+                                    direction=transfer["direction"],
+                                    from_addr=transfer["from_addr"],
+                                    to_addr=transfer["to_addr"],
+                                    tx_hash=tx_hash
                                 )
                                 
-                                for transfer in transfers:
-                                    if db.is_processed(tx_hash, transfer["wallet_address"]):
-                                        continue
-                                    
-                                    await send_transaction_alert(
-                                        wallet_name=transfer["wallet_name"],
-                                        wallet_address=transfer["wallet_address"],
-                                        token_symbol=transfer["token_symbol"],
-                                        amount=transfer["amount"],
-                                        direction=transfer["direction"],
-                                        from_addr=transfer["from_addr"],
-                                        to_addr=transfer["to_addr"],
-                                        tx_hash=tx_hash
-                                    )
-                                    
-                                    db.mark_processed(tx_hash, transfer["wallet_address"])
-                                    
-                            except Exception as e:
-                                logger.debug(f"Ошибка проверки ERC20: {e}")
-                                continue
+                                db.mark_processed(tx_hash, transfer["wallet_address"])
+                                
+                        except Exception as e:
+                            continue
+                    
+                    # ИСПРАВЛЕНИЕ #3: сохраняем last_block после каждого блока
+                    db.update_last_block(block_num)
                 
                 last_block = current_block
             
-            await asyncio.sleep(45)
+            # ИСПРАВЛЕНИЕ #4: уменьшили sleep до 10 секунд
+            await asyncio.sleep(10)
             
         except Exception as e:
             logger.error(f"Ошибка мониторинга: {e}")
