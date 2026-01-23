@@ -168,7 +168,7 @@ async def cmd_start(message: Message):
         "БНБ Бухгалтер запущен\n\n"
         "Команды:\n"
         "/balance — текущие балансы\n"
-        "/add_wallet <адрес> [название] — добавить кошелёк\n"
+        "/add_wallet <адрес> — добавить кошелёк\n"
         "/wallets — список кошельков"
     )
 
@@ -248,37 +248,24 @@ async def cmd_wallets(message: Message):
     
     await message.answer(msg)
 
-async def send_grouped_alert(wallet_name, wallet_address, transfers, tx_hash):
+async def send_transaction_alert(wallet_name, wallet_address, token_symbol, amount, direction, from_addr, to_addr, tx_hash):
     try:
-        if len(transfers) == 1:
-            transfer = transfers[0]
-            if transfer["direction"] == "IN":
-                emoji = "🟢"
-            else:
-                emoji = "🔴"
-            
-            msg = f"{emoji} {transfer['direction']} | {format_balance(transfer['amount'])} {transfer['token']}\n"
-            
-            if transfer["direction"] == "IN":
-                msg += f"From: {format_address(transfer['from'])}\n"
-            else:
-                msg += f"To: {format_address(transfer['to'])}\n"
-            
-            new_balance = get_balance(wallet_address, transfer['token'])
-            msg += f"Новый баланс: {format_balance(new_balance)} {transfer['token']}\n"
-            msg += f"<a href='https://bscscan.com/tx/{tx_hash}'>Tx</a>"
+        if direction == "IN":
+            emoji = "🟢"
         else:
-            msg = f"🔄 Мультитокен транзакция ({len(transfers)} токенов)\n\n"
-            
-            for transfer in transfers:
-                if transfer["direction"] == "IN":
-                    emoji = "🟢"
-                else:
-                    emoji = "🔴"
-                
-                msg += f"{emoji} {transfer['direction']} | {format_balance(transfer['amount'])} {transfer['token']}\n"
-            
-            msg += f"\n<a href='https://bscscan.com/tx/{tx_hash}'>Tx</a>"
+            emoji = "🔴"
+        
+        new_balance = get_balance(wallet_address, token_symbol)
+        
+        msg = f"{emoji} {direction} | {format_balance(amount)} {token_symbol}\n"
+        
+        if direction == "IN":
+            msg += f"From: {format_address(from_addr)}\n"
+        else:
+            msg += f"To: {format_address(to_addr)}\n"
+        
+        msg += f"Новый баланс: {format_balance(new_balance)} {token_symbol}\n"
+        msg += f"<a href='https://bscscan.com/tx/{tx_hash}'>Tx</a>"
         
         await bot.send_message(
             chat_id=TELEGRAM_USER_ID,
@@ -287,7 +274,7 @@ async def send_grouped_alert(wallet_name, wallet_address, transfers, tx_hash):
             disable_web_page_preview=True
         )
         
-        logger.info(f"Уведомление: {len(transfers)} операций в tx {tx_hash[:10]}")
+        logger.info(f"Уведомление: {direction} {amount} {token_symbol}")
         
     except Exception as e:
         logger.error(f"Ошибка отправки: {e}")
@@ -304,7 +291,6 @@ async def process_transaction(tx_hash, wallet_address, wallet_name):
             return
         
         wallet_address_lower = wallet_address.lower()
-        transfers = []
         
         if tx.value > 0:
             from_addr = tx['from'].lower()
@@ -312,23 +298,37 @@ async def process_transaction(tx_hash, wallet_address, wallet_name):
             
             if to_addr == wallet_address_lower:
                 amount = w3.from_wei(tx.value, 'ether')
-                transfers.append({
-                    "token": "BNB",
-                    "amount": float(amount),
-                    "direction": "IN",
-                    "from": tx['from'],
-                    "to": wallet_address
-                })
+                
+                await send_transaction_alert(
+                    wallet_name=wallet_name,
+                    wallet_address=wallet_address,
+                    token_symbol="BNB",
+                    amount=float(amount),
+                    direction="IN",
+                    from_addr=tx['from'],
+                    to_addr=wallet_address,
+                    tx_hash=tx_hash
+                )
+                
+                db.mark_processed(tx_hash)
+                return
             
             elif from_addr == wallet_address_lower:
                 amount = w3.from_wei(tx.value, 'ether')
-                transfers.append({
-                    "token": "BNB",
-                    "amount": float(amount),
-                    "direction": "OUT",
-                    "from": wallet_address,
-                    "to": tx['to']
-                })
+                
+                await send_transaction_alert(
+                    wallet_name=wallet_name,
+                    wallet_address=wallet_address,
+                    token_symbol="BNB",
+                    amount=float(amount),
+                    direction="OUT",
+                    from_addr=wallet_address,
+                    to_addr=tx['to'],
+                    tx_hash=tx_hash
+                )
+                
+                db.mark_processed(tx_hash)
+                return
         
         for token_symbol, token_info in TOKENS.items():
             if token_symbol == "BNB":
@@ -344,32 +344,39 @@ async def process_transaction(tx_hash, wallet_address, wallet_name):
                 to_addr = event['args']['to'].lower()
                 value = event['args']['value']
                 
-                is_direct_from = from_addr == wallet_address_lower and tx['from'].lower() == wallet_address_lower
-                is_direct_to = to_addr == wallet_address_lower and (tx['to'] and tx['to'].lower() == wallet_address_lower or from_addr == tx['from'].lower())
-                
-                if is_direct_to:
+                if to_addr == wallet_address_lower:
                     amount = value / (10 ** token_info["decimals"])
-                    transfers.append({
-                        "token": token_symbol,
-                        "amount": amount,
-                        "direction": "IN",
-                        "from": event['args']['from'],
-                        "to": wallet_address
-                    })
+                    
+                    await send_transaction_alert(
+                        wallet_name=wallet_name,
+                        wallet_address=wallet_address,
+                        token_symbol=token_symbol,
+                        amount=amount,
+                        direction="IN",
+                        from_addr=event['args']['from'],
+                        to_addr=wallet_address,
+                        tx_hash=tx_hash
+                    )
+                    
+                    db.mark_processed(tx_hash)
+                    break
                 
-                elif is_direct_from:
+                elif from_addr == wallet_address_lower:
                     amount = value / (10 ** token_info["decimals"])
-                    transfers.append({
-                        "token": token_symbol,
-                        "amount": amount,
-                        "direction": "OUT",
-                        "from": wallet_address,
-                        "to": event['args']['to']
-                    })
-        
-        if transfers:
-            await send_grouped_alert(wallet_name, wallet_address, transfers, tx_hash)
-            db.mark_processed(tx_hash)
+                    
+                    await send_transaction_alert(
+                        wallet_name=wallet_name,
+                        wallet_address=wallet_address,
+                        token_symbol=token_symbol,
+                        amount=amount,
+                        direction="OUT",
+                        from_addr=wallet_address,
+                        to_addr=event['args']['to'],
+                        tx_hash=tx_hash
+                    )
+                    
+                    db.mark_processed(tx_hash)
+                    break
                     
     except Exception as e:
         logger.error(f"Ошибка обработки tx {tx_hash}: {e}")
@@ -420,7 +427,7 @@ async def main():
         logger.error("Ошибка подключения к BSC")
         return
     
-    asyncio.create_task(monitor_blockchain())
+    asyncio.create_task(monitor_new_blocks())
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
