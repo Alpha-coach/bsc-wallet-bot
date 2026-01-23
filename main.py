@@ -344,7 +344,10 @@ async def process_transaction(tx_hash, wallet_address, wallet_name):
                 to_addr = event['args']['to'].lower()
                 value = event['args']['value']
                 
-                if to_addr == wallet_address_lower:
+                is_direct_from = from_addr == wallet_address_lower and tx['from'].lower() == wallet_address_lower
+                is_direct_to = to_addr == wallet_address_lower and (tx['to'] and tx['to'].lower() == wallet_address_lower or from_addr == tx['from'].lower())
+                
+                if is_direct_to:
                     amount = value / (10 ** token_info["decimals"])
                     transfers.append({
                         "token": token_symbol,
@@ -354,7 +357,7 @@ async def process_transaction(tx_hash, wallet_address, wallet_name):
                         "to": wallet_address
                     })
                 
-                elif from_addr == wallet_address_lower:
+                elif is_direct_from:
                     amount = value / (10 ** token_info["decimals"])
                     transfers.append({
                         "token": token_symbol,
@@ -417,7 +420,7 @@ async def main():
         logger.error("Ошибка подключения к BSC")
         return
     
-    asyncio.create_task(monitor_new_blocks())
+    asyncio.create_task(monitor_blockchain())
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
