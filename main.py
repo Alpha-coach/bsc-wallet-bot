@@ -7,6 +7,7 @@ from aiogram.filters import Command
 from aiogram.types import Message
 from web3 import Web3
 import json
+import aiohttp
 
 logging.basicConfig(
     level=logging.INFO,
@@ -35,23 +36,28 @@ except ImportError:
 TOKENS = {
     "BNB": {
         "address": None,
-        "decimals": 18
+        "decimals": 18,
+        "coingecko_id": "binancecoin"
     },
     "USDT": {
         "address": "0x55d398326f99059fF775485246999027B3197955",
-        "decimals": 18
+        "decimals": 18,
+        "coingecko_id": "tether"
     },
     "USDC": {
         "address": "0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d",
-        "decimals": 18
+        "decimals": 18,
+        "coingecko_id": "usd-coin"
     },
     "BTCB": {
         "address": "0x7130d2A12B9BCbFAe4f2634d864A1Ee1Ce3Ead9c",
-        "decimals": 18
+        "decimals": 18,
+        "coingecko_id": "bitcoin"
     },
     "MEC": {
         "address": "0x9a79D9C9e521cb900D2584c74bb41997EB7BF49f",
-        "decimals": 18
+        "decimals": 18,
+        "coingecko_id": None  # Если есть ID на CoinGecko - добавь сюда
     }
 }
 
@@ -74,6 +80,63 @@ ERC20_ABI = [
         "type": "event"
     }
 ]
+
+# Кэш для цен (обновляется каждые 5 минут)
+price_cache = {}
+price_cache_time = 0
+
+async def get_token_prices():
+    """Получить цены токенов в USD из CoinGecko"""
+    global price_cache, price_cache_time
+    
+    current_time = asyncio.get_event_loop().time()
+    
+    # Если кэш свежий (меньше 5 минут) - возвращаем его
+    if current_time - price_cache_time < 300 and price_cache:
+        return price_cache
+    
+    try:
+        # Собираем все coingecko_id для запроса
+        coin_ids = []
+        for token_info in TOKENS.values():
+            if token_info.get("coingecko_id"):
+                coin_ids.append(token_info["coingecko_id"])
+        
+        if not coin_ids:
+            return {}
+        
+        # Запрос к CoinGecko API
+        ids_string = ",".join(coin_ids)
+        url = f"https://api.coingecko.com/api/v3/simple/price?ids={ids_string}&vs_currencies=usd"
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    
+                    # Преобразуем в удобный формат: token_symbol -> price
+                    new_cache = {}
+                    for token_symbol, token_info in TOKENS.items():
+                        coingecko_id = token_info.get("coingecko_id")
+                        if coingecko_id and coingecko_id in data:
+                            new_cache[token_symbol] = data[coingecko_id]["usd"]
+                    
+                    price_cache = new_cache
+                    price_cache_time = current_time
+                    logger.info(f"Цены обновлены: {price_cache}")
+                    return price_cache
+    
+    except Exception as e:
+        logger.error(f"Ошибка получения цен: {e}")
+    
+    return price_cache
+
+def format_usd(amount, token_symbol):
+    """Форматировать сумму в USD"""
+    if token_symbol in price_cache:
+        usd_value = amount * price_cache[token_symbol]
+        return f" (${usd_value:,.2f})"
+    return ""
 
 class SimpleDB:
     def __init__(self):
@@ -117,6 +180,19 @@ class SimpleDB:
         self.save()
         logger.info(f"Кошелёк добавлен с блока {current_block}")
         return True
+    
+    def remove_wallet(self, index):
+        """Удалить кошелёк по индексу"""
+        try:
+            if 0 <= index < len(self.wallets):
+                removed = self.wallets.pop(index)
+                self.save()
+                logger.info(f"Кошелёк удалён: {removed['name']}")
+                return True, removed
+            return False, None
+        except Exception as e:
+            logger.error(f"Ошибка удаления кошелька: {e}")
+            return False, None
     
     def mark_processed(self, tx_hash):
         self.processed_txs.add(tx_hash)
@@ -173,7 +249,8 @@ async def cmd_start(message: Message):
         "Команды:\n"
         "/balance — текущие балансы\n"
         "/add_wallet <адрес> — добавить кошелёк\n"
-        "/wallets — список кошельков"
+        "/wallets — список кошельков\n"
+        "/remove_wallet — удалить кошелёк"
     )
 
 @dp.message(Command("balance"))
@@ -185,6 +262,9 @@ async def cmd_balance(message: Message):
     if not db.wallets:
         await message.answer("Нет добавленных кошельков\nИспользуй /add_wallet")
         return
+    
+    # Обновляем цены перед показом балансов
+    await get_token_prices()
     
     for wallet in db.wallets:
         address = wallet["address"]
@@ -198,7 +278,8 @@ async def cmd_balance(message: Message):
         msg += f"{format_address(address)}\n\n"
         
         for token, amount in balances.items():
-            msg += f"{token}: {format_balance(amount)}\n"
+            usd_str = format_usd(amount, token)
+            msg += f"{token}: {format_balance(amount)}{usd_str}\n"
         
         now_utc = datetime.now(timezone.utc).strftime("%H:%M UTC")
         msg += f"\nобновлено: {now_utc}"
@@ -250,25 +331,72 @@ async def cmd_wallets(message: Message):
         msg += f"{i}. {wallet['name']}\n"
         msg += f"   {format_address(wallet['address'])}\n\n"
     
+    msg += "Для удаления используй:\n/remove_wallet <номер>"
+    
     await message.answer(msg)
+
+@dp.message(Command("remove_wallet"))
+async def cmd_remove_wallet(message: Message):
+    if not is_authorized(message.from_user.id):
+        await message.answer("Доступ запрещён")
+        return
+    
+    if not db.wallets:
+        await message.answer("Нет кошельков для удаления")
+        return
+    
+    args = message.text.split(maxsplit=1)
+    
+    # Если номер не указан - показываем список
+    if len(args) < 2:
+        msg = "Выбери номер кошелька для удаления:\n\n"
+        for i, wallet in enumerate(db.wallets, 1):
+            msg += f"{i}. {wallet['name']}\n"
+            msg += f"   {format_address(wallet['address'])}\n\n"
+        msg += "Используй: /remove_wallet <номер>"
+        await message.answer(msg)
+        return
+    
+    # Пытаемся удалить по номеру
+    try:
+        wallet_num = int(args[1])
+        success, removed_wallet = db.remove_wallet(wallet_num - 1)
+        
+        if success:
+            await message.answer(
+                f"✅ Кошелёк удалён:\n"
+                f"{removed_wallet['name']}\n"
+                f"{format_address(removed_wallet['address'])}"
+            )
+        else:
+            await message.answer("❌ Неверный номер кошелька")
+    
+    except ValueError:
+        await message.answer("❌ Укажи номер кошелька (число)")
 
 async def send_transaction_alert(wallet_name, wallet_address, token_symbol, amount, direction, from_addr, to_addr, tx_hash):
     try:
+        # Обновляем цены перед отправкой уведомления
+        await get_token_prices()
+        
         if direction == "IN":
             emoji = "🟢"
         else:
             emoji = "🔴"
         
         new_balance = get_balance(wallet_address, token_symbol)
+        usd_amount = format_usd(amount, token_symbol)
+        usd_balance = format_usd(new_balance, token_symbol)
         
-        msg = f"{emoji} {direction} | {format_balance(amount)} {token_symbol}\n"
+        msg = f"{emoji} {direction} | {format_balance(amount)} {token_symbol}{usd_amount}\n"
+        msg += f"Кошелёк: {wallet_name}\n"
         
         if direction == "IN":
             msg += f"From: {format_address(from_addr)}\n"
         else:
             msg += f"To: {format_address(to_addr)}\n"
         
-        msg += f"Новый баланс: {format_balance(new_balance)} {token_symbol}\n"
+        msg += f"Новый баланс: {format_balance(new_balance)} {token_symbol}{usd_balance}\n"
         msg += f"<a href='https://bscscan.com/tx/{tx_hash}'>Tx</a>"
         
         await bot.send_message(
@@ -278,7 +406,7 @@ async def send_transaction_alert(wallet_name, wallet_address, token_symbol, amou
             disable_web_page_preview=True
         )
         
-        logger.info(f"Уведомление: {direction} {amount} {token_symbol}")
+        logger.info(f"Уведомление: {direction} {amount} {token_symbol}{usd_amount}")
         
     except Exception as e:
         logger.error(f"Ошибка отправки: {e}")
@@ -420,7 +548,7 @@ async def monitor_new_blocks():
             
         except Exception as e:
             logger.error(f"Ошибка мониторинга: {e}")
-            await asyncio.sleep(10)
+            await asyncio.sleep(30)
 
 async def main():
     logger.info("Бот запускается")
@@ -430,6 +558,9 @@ async def main():
     else:
         logger.error("Ошибка подключения к BSC")
         return
+    
+    # Загружаем цены при старте
+    await get_token_prices()
     
     asyncio.create_task(monitor_new_blocks())
     await dp.start_polling(bot)
