@@ -263,8 +263,10 @@ async def get_bnb_transfers_bscscan(address, start_block):
                 data = await response.json()
                 
                 if data["status"] == "1":
+                    logger.info(f"BscScan BNB: найдено {len(data['result'])} транзакций")
                     return data["result"]
                 else:
+                    logger.info(f"BscScan BNB: транзакций не найдено")
                     return []
                     
     except Exception as e:
@@ -290,8 +292,10 @@ async def get_token_transfers_bscscan(address, token_address, start_block):
                 data = await response.json()
                 
                 if data["status"] == "1":
+                    logger.info(f"BscScan токен {token_address[:10]}: найдено {len(data['result'])} транзакций")
                     return data["result"]
                 else:
+                    logger.info(f"BscScan токен {token_address[:10]}: транзакций не найдено")
                     return []
                     
     except Exception as e:
@@ -311,13 +315,18 @@ async def check_wallet_transactions(wallet_address, wallet_name):
             tx_hash = tx["hash"]
             block_number = int(tx["blockNumber"])
             
+            logger.info(f"Проверка BNB tx {tx_hash[:10]} блок {block_number}")
+            
             if block_number <= db.last_block:
+                logger.info(f"Пропуск: блок {block_number} <= {db.last_block}")
                 continue
             
             if db.is_processed(tx_hash):
+                logger.info(f"Пропуск: уже обработана")
                 continue
             
             if tx["isError"] != "0":
+                logger.info(f"Пропуск: ошибка транзакции")
                 continue
             
             from_addr = tx["from"]
@@ -325,17 +334,21 @@ async def check_wallet_transactions(wallet_address, wallet_name):
             value = int(tx["value"])
             
             if value == 0:
+                logger.info(f"Пропуск: сумма 0")
                 continue
             
             is_incoming = to_addr.lower() == wallet_address.lower()
             is_outgoing = from_addr.lower() == wallet_address.lower()
             
             if not (is_incoming or is_outgoing):
+                logger.info(f"Пропуск: не наш адрес")
                 continue
             
             amount = value / (10 ** 18)
             
             direction = "IN" if is_incoming else "OUT"
+            
+            logger.info(f"✅ Найдена BNB транзакция: {direction} {amount}")
             
             await send_transaction_alert(
                 wallet_name=wallet_name,
@@ -368,10 +381,14 @@ async def check_wallet_transactions(wallet_address, wallet_name):
                 tx_hash = tx["hash"]
                 block_number = int(tx["blockNumber"])
                 
+                logger.info(f"Проверка {token_symbol} tx {tx_hash[:10]} блок {block_number}")
+                
                 if block_number <= db.last_block:
+                    logger.info(f"Пропуск: блок {block_number} <= {db.last_block}")
                     continue
                 
                 if db.is_processed(tx_hash):
+                    logger.info(f"Пропуск: уже обработана")
                     continue
                 
                 from_addr = tx["from"]
@@ -382,12 +399,15 @@ async def check_wallet_transactions(wallet_address, wallet_name):
                 is_outgoing = from_addr.lower() == wallet_address.lower()
                 
                 if not (is_incoming or is_outgoing):
+                    logger.info(f"Пропуск: не наш адрес")
                     continue
                 
                 decimals = token_info["decimals"]
                 amount = value / (10 ** decimals)
                 
                 direction = "IN" if is_incoming else "OUT"
+                
+                logger.info(f"✅ Найдена {token_symbol} транзакция: {direction} {amount}")
                 
                 await send_transaction_alert(
                     wallet_name=wallet_name,
