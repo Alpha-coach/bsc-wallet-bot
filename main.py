@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 TELEGRAM_USER_ID = int(os.getenv("TELEGRAM_USER_ID"))
 BNB_RPC = os.getenv("BNB_RPC", "https://bsc-dataseed.binance.org/")
+BSCSCAN_API_KEY = os.getenv("BSCSCAN_API_KEY", "YourApiKeyToken")  # Бесплатный без регистрации
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -216,6 +217,99 @@ def get_balance_sync(address, token_symbol):
 async def get_balance(address, token_symbol):
     return await asyncio.to_thread(get_balance_sync, address, token_symbol)
 
+async def get_recent_transactions_bscscan(wallet_address, token_symbol):
+    """Получаем последние транзакции через BSCScan API"""
+    try:
+        wallet_address = wallet_address.lower()
+        
+        if token_symbol == "BNB":
+            # BNB транзакции
+            url = f"https://api.bscscan.com/api?module=account&action=txlist&address={wallet_address}&startblock=0&endblock=99999999&page=1&offset=10&sort=desc&apikey={BSCSCAN_API_KEY}"
+        else:
+            # ERC-20 транзакции
+            token_address = TOKENS[token_symbol]["address"]
+            if not token_address:
+                return []
+            url = f"https://api.bscscan.com/api?module=account&action=tokentx&contractaddress={token_address}&address={wallet_address}&page=1&offset=10&sort=desc&apikey={BSCSCAN_API_KEY}"
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if data["status"] == "1" and data["message"] == "OK":
+                        return data["result"][:5]  # Последние 5 транзакций
+        
+        return []
+    
+    except Exception as e:
+        logger.error(f"Ошибка получения транзакций из BSCScan: {e}")
+        return []
+
+async def find_matching_transaction(wallet_address, token_symbol, expected_amount, direction):
+    """Ищем транзакцию которая соответствует изменению баланса"""
+    try:
+        transactions = await get_recent_transactions_bscscan(wallet_address, token_symbol)
+        
+        if not transactions:
+            return None
+        
+        wallet_lower = wallet_address.lower()
+        
+        for tx in transactions:
+            if token_symbol == "BNB":
+                # BNB транзакция
+                tx_from = tx["from"].lower()
+                tx_to = tx["to"].lower()
+                amount = float(w3.from_wei(int(tx["value"]), 'ether'))
+                
+                # Проверяем направление и сумму
+                if direction == "IN" and tx_to == wallet_lower:
+                    if abs(amount - expected_amount) < 0.0001:
+                        return {
+                            "from": tx["from"],
+                            "to": tx["to"],
+                            "hash": tx["hash"],
+                            "amount": amount
+                        }
+                elif direction == "OUT" and tx_from == wallet_lower:
+                    if abs(amount - expected_amount) < 0.0001:
+                        return {
+                            "from": tx["from"],
+                            "to": tx["to"],
+                            "hash": tx["hash"],
+                            "amount": amount
+                        }
+            else:
+                # ERC-20 транзакция
+                tx_from = tx["from"].lower()
+                tx_to = tx["to"].lower()
+                decimals = TOKENS[token_symbol]["decimals"]
+                amount = int(tx["value"]) / (10 ** decimals)
+                
+                # Проверяем направление и сумму
+                if direction == "IN" and tx_to == wallet_lower:
+                    if abs(amount - expected_amount) < 0.001:  # Больше погрешность для токенов
+                        return {
+                            "from": tx["from"],
+                            "to": tx["to"],
+                            "hash": tx["hash"],
+                            "amount": amount
+                        }
+                elif direction == "OUT" and tx_from == wallet_lower:
+                    if abs(amount - expected_amount) < 0.001:
+                        return {
+                            "from": tx["from"],
+                            "to": tx["to"],
+                            "hash": tx["hash"],
+                            "amount": amount
+                        }
+        
+        return None
+    
+    except Exception as e:
+        logger.error(f"Ошибка поиска транзакции: {e}")
+        return None
+
 def format_address(address):
     if not address:
         return ""
@@ -403,26 +497,47 @@ async def check_balances():
                     if abs(diff) > 0.0001:  # Изменение больше 0.0001
                         logger.info(f"💰 ИЗМЕНЕНИЕ! {name} {token_symbol} diff={diff}")
                         
-                        # Отправляем алерт об изменении баланса
                         direction = "IN" if diff > 0 else "OUT"
-                        emoji = "🟢" if diff > 0 else "🔴"
                         amount = abs(diff)
                         
+                        # Пытаемся найти детали транзакции
+                        tx_details = await find_matching_transaction(address, token_symbol, amount, direction)
+                        
+                        emoji = "🟢" if direction == "IN" else "🔴"
                         usd_str = format_usd(amount, token_symbol)
                         usd_balance = format_usd(current_balance, token_symbol)
                         
                         msg = f"{emoji} {direction} | {format_balance(amount)} {token_symbol}{usd_str}\n"
                         msg += f"Кошелёк: {name}\n"
-                        msg += f"Новый баланс: {format_balance(current_balance)} {token_symbol}{usd_balance}\n"
                         
-                        now_utc = datetime.now(timezone.utc).strftime("%H:%M UTC")
-                        msg += f"\n🕐 {now_utc}"
+                        if tx_details:
+                            # Нашли транзакцию - показываем детали
+                            if direction == "IN":
+                                msg += f"From: {format_address(tx_details['from'])}\n"
+                            else:
+                                msg += f"To: {format_address(tx_details['to'])}\n"
+                            
+                            msg += f"Новый баланс: {format_balance(current_balance)} {token_symbol}{usd_balance}\n"
+                            msg += f"<a href='https://bscscan.com/tx/{tx_details['hash']}'>Tx</a>"
+                            
+                            parse_mode = "HTML"
+                            disable_preview = True
+                            logger.info(f"✅ Найдена транзакция: {tx_details['hash'][:10]}...")
+                        else:
+                            # Не нашли - простой алерт
+                            msg += f"Новый баланс: {format_balance(current_balance)} {token_symbol}{usd_balance}\n"
+                            now_utc = datetime.now(timezone.utc).strftime("%H:%M UTC")
+                            msg += f"\n🕐 {now_utc}"
+                            
+                            parse_mode = None
+                            disable_preview = False
                         
                         try:
                             await bot.send_message(
                                 chat_id=TELEGRAM_USER_ID,
                                 text=msg,
-                                parse_mode=None
+                                parse_mode=parse_mode,
+                                disable_web_page_preview=disable_preview
                             )
                             logger.info(f"✅ Алерт отправлен!")
                         except Exception as e:
