@@ -583,9 +583,9 @@ async def check_balances():
 async def main():
     logger.info("🚀 Бот запускается (гибридная версия)")
     
-    is_connected = await asyncio.to_thread(w3.is_connected)
+    is_connected = w3.is_connected()
     if is_connected:
-        block_num = await asyncio.to_thread(w3.eth.block_number)
+        block_num = w3.eth.block_number
         logger.info(f"✅ BSC подключен (блок: {block_num})")
     else:
         logger.error("❌ Ошибка подключения к BSC")
