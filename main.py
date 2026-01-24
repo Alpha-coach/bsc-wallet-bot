@@ -216,115 +216,6 @@ def get_balance_sync(address, token_symbol):
 async def get_balance(address, token_symbol):
     return await asyncio.to_thread(get_balance_sync, address, token_symbol)
 
-def find_recent_transactions_sync(wallet_address, token_symbol, expected_diff):
-    """Ищем последние транзакции для кошелька и токена"""
-    try:
-        wallet_address = wallet_address.lower()
-        current_block = w3.eth.block_number
-        
-        # Ищем в последних 50 блоках
-        start_block = max(0, current_block - 50)
-        
-        logger.info(f"🔍 Ищу транзакции {token_symbol} в блоках {start_block}-{current_block}")
-        
-        if token_symbol == "BNB":
-            # Поиск BNB транзакций
-            for block_num in range(current_block, start_block, -1):
-                try:
-                    block = w3.eth.get_block(block_num, full_transactions=True)
-                    
-                    for tx in block.transactions:
-                        if tx.value == 0:
-                            continue
-                        
-                        tx_from = tx['from'].lower()
-                        tx_to = tx['to'].lower() if tx['to'] else ""
-                        
-                        if tx_to == wallet_address:
-                            amount = float(w3.from_wei(tx.value, 'ether'))
-                            if abs(amount - abs(expected_diff)) < 0.0001:
-                                return {
-                                    "direction": "IN",
-                                    "from": tx['from'],
-                                    "to": tx['to'],
-                                    "amount": amount,
-                                    "tx_hash": tx.hash.hex()
-                                }
-                        
-                        elif tx_from == wallet_address:
-                            amount = float(w3.from_wei(tx.value, 'ether'))
-                            if abs(amount - abs(expected_diff)) < 0.0001:
-                                return {
-                                    "direction": "OUT",
-                                    "from": tx['from'],
-                                    "to": tx['to'],
-                                    "amount": amount,
-                                    "tx_hash": tx.hash.hex()
-                                }
-                
-                except Exception as e:
-                    continue
-        
-        else:
-            # Поиск ERC-20 транзакций через логи
-            token_info = TOKENS[token_symbol]
-            token_address = Web3.to_checksum_address(token_info["address"])
-            
-            # Создаём фильтр для Transfer событий
-            for block_num in range(current_block, start_block, -1):
-                try:
-                    block = w3.eth.get_block(block_num, full_transactions=False)
-                    
-                    # Получаем все логи блока
-                    logs = w3.eth.get_logs({
-                        'fromBlock': block_num,
-                        'toBlock': block_num,
-                        'address': token_address
-                    })
-                    
-                    for log in logs:
-                        if len(log['topics']) < 3:
-                            continue
-                        
-                        if log['topics'][0].hex() != TRANSFER_EVENT_SIGNATURE:
-                            continue
-                        
-                        from_addr = '0x' + log['topics'][1].hex()[-40:]
-                        to_addr = '0x' + log['topics'][2].hex()[-40:]
-                        
-                        value = int(log['data'].hex(), 16)
-                        amount = value / (10 ** token_info["decimals"])
-                        
-                        if to_addr.lower() == wallet_address and abs(amount - abs(expected_diff)) < 0.0001:
-                            return {
-                                "direction": "IN",
-                                "from": from_addr,
-                                "to": to_addr,
-                                "amount": amount,
-                                "tx_hash": log['transactionHash'].hex()
-                            }
-                        
-                        elif from_addr.lower() == wallet_address and abs(amount - abs(expected_diff)) < 0.0001:
-                            return {
-                                "direction": "OUT",
-                                "from": from_addr,
-                                "to": to_addr,
-                                "amount": amount,
-                                "tx_hash": log['transactionHash'].hex()
-                            }
-                
-                except Exception as e:
-                    continue
-        
-        return None
-    
-    except Exception as e:
-        logger.error(f"Ошибка поиска транзакций: {e}")
-        return None
-
-async def find_recent_transactions(wallet_address, token_symbol, expected_diff):
-    return await asyncio.to_thread(find_recent_transactions_sync, wallet_address, token_symbol, expected_diff)
-
 def format_address(address):
     if not address:
         return ""
@@ -350,10 +241,9 @@ async def cmd_start(message: Message):
         return
     
     await message.answer(
-        "БНБ Бухгалтер (гибридная версия)\n\n"
+        "БНБ Бухгалтер запущен\n\n"
         "🔍 Проверка балансов каждые 30 секунд\n"
-        "🔎 Поиск деталей транзакции при изменении\n"
-        "💬 Полные алерты с адресами и хэшами\n\n"
+        "💬 Алерты при любом изменении\n\n"
         "Команды:\n"
         "/balance — текущие балансы\n"
         "/add_wallet <адрес> — добавить кошелёк\n"
@@ -480,8 +370,8 @@ async def cmd_remove_wallet(message: Message):
         await message.answer("❌ Укажи номер кошелька (число)")
 
 async def check_balances():
-    """ГИБРИДНЫЙ мониторинг: проверяем балансы + ищем детали транзакции"""
-    logger.info("⏰ Гибридный мониторинг запущен")
+    """Мониторинг балансов: проверяем каждые 30 секунд"""
+    logger.info("⏰ Мониторинг балансов запущен (проверка каждые 30 сек)")
     
     while True:
         try:
@@ -513,63 +403,30 @@ async def check_balances():
                     if abs(diff) > 0.0001:  # Изменение больше 0.0001
                         logger.info(f"💰 ИЗМЕНЕНИЕ! {name} {token_symbol} diff={diff}")
                         
-                        # Ищем детали транзакции
-                        tx_details = await find_recent_transactions(address, token_symbol, diff)
+                        # Отправляем алерт об изменении баланса
+                        direction = "IN" if diff > 0 else "OUT"
+                        emoji = "🟢" if diff > 0 else "🔴"
+                        amount = abs(diff)
                         
-                        if tx_details:
-                            # Нашли транзакцию - отправляем детальный алерт
-                            direction = tx_details["direction"]
-                            emoji = "🟢" if direction == "IN" else "🔴"
-                            amount = tx_details["amount"]
-                            
-                            usd_str = format_usd(amount, token_symbol)
-                            usd_balance = format_usd(current_balance, token_symbol)
-                            
-                            msg = f"{emoji} {direction} | {format_balance(amount)} {token_symbol}{usd_str}\n"
-                            msg += f"Кошелёк: {name}\n"
-                            
-                            if direction == "IN":
-                                msg += f"From: {format_address(tx_details['from'])}\n"
-                            else:
-                                msg += f"To: {format_address(tx_details['to'])}\n"
-                            
-                            msg += f"Новый баланс: {format_balance(current_balance)} {token_symbol}{usd_balance}\n"
-                            msg += f"<a href='https://bscscan.com/tx/{tx_details['tx_hash']}'>Tx</a>"
-                            
-                            try:
-                                await bot.send_message(
-                                    chat_id=TELEGRAM_USER_ID,
-                                    text=msg,
-                                    parse_mode="HTML",
-                                    disable_web_page_preview=True
-                                )
-                                logger.info(f"✅ Детальный алерт отправлен!")
-                            except Exception as e:
-                                logger.error(f"❌ Ошибка отправки алерта: {e}")
+                        usd_str = format_usd(amount, token_symbol)
+                        usd_balance = format_usd(current_balance, token_symbol)
                         
-                        else:
-                            # Не нашли транзакцию - отправляем простой алерт
-                            direction = "IN" if diff > 0 else "OUT"
-                            emoji = "🟢" if diff > 0 else "🔴"
-                            amount = abs(diff)
-                            
-                            usd_str = format_usd(amount, token_symbol)
-                            usd_balance = format_usd(current_balance, token_symbol)
-                            
-                            msg = f"{emoji} {direction} | {format_balance(amount)} {token_symbol}{usd_str}\n"
-                            msg += f"Кошелёк: {name}\n"
-                            msg += f"Новый баланс: {format_balance(current_balance)} {token_symbol}{usd_balance}\n"
-                            msg += f"\n⚠️ Детали транзакции не найдены"
-                            
-                            try:
-                                await bot.send_message(
-                                    chat_id=TELEGRAM_USER_ID,
-                                    text=msg,
-                                    parse_mode=None
-                                )
-                                logger.info(f"✅ Простой алерт отправлен")
-                            except Exception as e:
-                                logger.error(f"❌ Ошибка отправки алерта: {e}")
+                        msg = f"{emoji} {direction} | {format_balance(amount)} {token_symbol}{usd_str}\n"
+                        msg += f"Кошелёк: {name}\n"
+                        msg += f"Новый баланс: {format_balance(current_balance)} {token_symbol}{usd_balance}\n"
+                        
+                        now_utc = datetime.now(timezone.utc).strftime("%H:%M UTC")
+                        msg += f"\n🕐 {now_utc}"
+                        
+                        try:
+                            await bot.send_message(
+                                chat_id=TELEGRAM_USER_ID,
+                                text=msg,
+                                parse_mode=None
+                            )
+                            logger.info(f"✅ Алерт отправлен!")
+                        except Exception as e:
+                            logger.error(f"❌ Ошибка отправки алерта: {e}")
                         
                         # Обновляем баланс
                         db.set_balance(address, token_symbol, current_balance)
@@ -581,7 +438,7 @@ async def check_balances():
             await asyncio.sleep(30)
 
 async def main():
-    logger.info("🚀 Бот запускается (гибридная версия)")
+    logger.info("🚀 Бот запускается")
     
     is_connected = w3.is_connected()
     if is_connected:
